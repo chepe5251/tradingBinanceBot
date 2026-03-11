@@ -1,7 +1,7 @@
 # Binance Futures Scalping Bot (USDT-M)
 
 Algorithmic trading bot for **Binance USDT-M Futures** with:
-- multi-pair scanning (up to 200 symbols),
+- full-universe multi-pair scanning (all available USDT-M perpetual symbols),
 - Telegram signal broadcasting,
 - automatic execution with only 1 active trade at a time,
 - TP/SL protection and continuous monitoring.
@@ -10,7 +10,7 @@ Algorithmic trading bot for **Binance USDT-M Futures** with:
 This software can open and close real positions. Use it at your own risk. Start in **testnet** or **paper mode** first.
 
 ## Core Features
-- USDT perpetual symbol universe scanning.
+- Full USDT perpetual symbol universe scanning (no hard symbol cap by default).
 - Signal strategy on `M15` with strict `1H` bias alignment.
 - Sends **all** valid signals to Telegram.
 - Executes only the first valid signal when:
@@ -114,4 +114,3 @@ git add .
 git commit -m "update readme"
 git push
 ```
-

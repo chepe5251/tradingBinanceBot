@@ -21,38 +21,12 @@ class Settings:
     """
 
     # Trading
-    symbol: str = "BNBUSDT"
-    symbols: list[str] = field(
-        default_factory=lambda: [
-            "BTCUSDT",
-            "ETHUSDT",
-            "BNBUSDT",
-            "SOLUSDT",
-            "XRPUSDT",
-            "ADAUSDT",
-            "DOGEUSDT",
-            "AVAXUSDT",
-            "LINKUSDT",
-            "DOTUSDT",
-        ]
-    )
+    symbol: str = "BTCUSDT"
+    symbols: list[str] = field(default_factory=list)
     extra_symbols: list[str] = field(default_factory=list)
     use_top_volume_symbols: bool = False
-    top_volume_symbols_count: int = 10
-    top_volume_allowlist: list[str] = field(
-        default_factory=lambda: [
-            "BTCUSDT",
-            "ETHUSDT",
-            "BNBUSDT",
-            "SOLUSDT",
-            "XRPUSDT",
-            "ADAUSDT",
-            "DOGEUSDT",
-            "AVAXUSDT",
-            "LINKUSDT",
-            "DOTUSDT",
-        ]
-    )
+    top_volume_symbols_count: int = 0
+    top_volume_allowlist: list[str] = field(default_factory=list)
     top_volume_min_price: float = 0.0
     top_volume_min_quote_volume: float = 0.0
     main_interval: str = "15m"
@@ -258,22 +232,27 @@ def from_env() -> Settings:
         except ValueError:
             pass
 
-    # Enforce symbol universe
-    settings.symbols = [
-        "BTCUSDT",
-        "ETHUSDT",
-        "BNBUSDT",
-        "SOLUSDT",
-        "XRPUSDT",
-        "ADAUSDT",
-        "DOGEUSDT",
-        "AVAXUSDT",
-        "LINKUSDT",
-        "DOTUSDT",
-    ]
-    settings.extra_symbols = []
-    settings.use_top_volume_symbols = False
-    settings.top_volume_allowlist = list(settings.symbols)
-    settings.top_volume_symbols_count = len(settings.symbols)
+    symbols = os.getenv("SYMBOLS")
+    if symbols:
+        settings.symbols = _parse_list(symbols)
+
+    extra_symbols = os.getenv("EXTRA_SYMBOLS")
+    if extra_symbols:
+        settings.extra_symbols = _parse_list(extra_symbols)
+
+    use_top = os.getenv("USE_TOP_VOLUME_SYMBOLS")
+    if use_top is not None:
+        settings.use_top_volume_symbols = _parse_bool(use_top)
+
+    top_count = os.getenv("TOP_VOLUME_SYMBOLS_COUNT")
+    if top_count:
+        try:
+            settings.top_volume_symbols_count = max(0, int(top_count))
+        except ValueError:
+            pass
+
+    allowlist = os.getenv("TOP_VOLUME_ALLOWLIST")
+    if allowlist:
+        settings.top_volume_allowlist = _parse_list(allowlist)
 
     return settings

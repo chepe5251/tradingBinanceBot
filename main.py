@@ -436,7 +436,7 @@ def main() -> None:
     trade_client = _configure_client(api_key or "", api_secret or "", settings.use_testnet)
     data_client = _configure_client("", "", settings.data_use_testnet)
 
-    symbols = _load_all_usdt_perp_symbols(data_client, logger, limit=200)
+    symbols = _load_all_usdt_perp_symbols(data_client, logger, limit=None)
     if not symbols:
         symbols = settings.symbols or [settings.symbol]
         logger.warning("Falling back to configured symbols (%d)", len(symbols))

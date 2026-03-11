@@ -86,7 +86,7 @@ class MarketDataStream:
         self._restarting = False
         self._last_error_log = 0.0
         self._last_event_wall: Optional[float] = None
-        # WS stability tuning for large universes (e.g. 200 symbols x 2 intervals).
+        # WS stability tuning for large universes (full USDT-M symbol list).
         self._stream_chunk_size: int = 50
         self._chunk_start_delay_sec: float = 0.5
 
