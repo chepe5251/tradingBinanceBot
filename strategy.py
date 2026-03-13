@@ -19,7 +19,7 @@ MACD_SLOW = 26
 MACD_SIGNAL = 9
 
 VOL_CONFIRM_WINDOW = 5
-RANGE_MAX_CROSSES = 3
+RANGE_MAX_CROSSES = 4
 RANGE_CROSS_LOOKBACK = 15
 SWING_LOOKBACK = 8
 MIN_RR_TARGET = 1.8
@@ -63,7 +63,7 @@ def _is_flat_range(ema_fast: pd.Series, ema_mid: pd.Series) -> bool:
         return True
     diff = (ema_fast - ema_mid).iloc[-RANGE_CROSS_LOOKBACK:]
     sign = diff > 0
-    crosses = int((sign != sign.shift(1)).sum())
+    crosses = int((sign != sign.shift(1)).dropna().sum())
     return crosses >= RANGE_MAX_CROSSES
 
 
@@ -150,6 +150,9 @@ def evaluate_signal(
         prev1["hist"],
         prev3["open"],
         prev3["close"],
+        last["close"],
+        last["volume"],
+        h1_last["close"],
         h1_last["ema50"],
         h1_last["atr"],
         h1_prev["ema50"],
@@ -199,7 +202,7 @@ def evaluate_signal(
 
     ema7_last = float(last["ema7"])
     ema25_last = float(last["ema25"])
-    if abs(price - ema7_last) > atr_val * 0.3:
+    if abs(price - ema7_last) > atr_val * 0.45:
         return None
 
     body = abs(float(last["close"] - last["open"]))
@@ -208,9 +211,10 @@ def evaluate_signal(
         return None
 
     # Volume filter.
-    vol_avg5 = float(last["vol_avg5_prev"] or 0.0)
+    vol_avg5_raw = last["vol_avg5_prev"]
+    vol_avg5 = float(vol_avg5_raw) if not pd.isna(vol_avg5_raw) else 0.0
     vol_last = float(last["volume"])
-    vol_confirm_ok = vol_avg5 > 0 and vol_last >= (vol_avg5 * 1.3)
+    vol_confirm_ok = vol_avg5 > 0 and vol_last >= (vol_avg5 * 1.2)
     if not vol_confirm_ok:
         return None
 
@@ -231,7 +235,7 @@ def evaluate_signal(
     swing_low = float(swing_w["low"].min()) if not swing_w.empty else float(prev1["low"])
     swing_high = float(swing_w["high"].max()) if not swing_w.empty else float(prev1["high"])
     impulse_leg = swing_high - swing_low
-    if impulse_leg < atr_val * 1.0:
+    if impulse_leg < atr_val * 0.8:
         return None
 
     dif_last = float(last["dif"])
@@ -274,7 +278,6 @@ def evaluate_signal(
         and dif_last > 0
         and red1
         and not (red1 and red2 and red3)
-        and prev1_close < prev1_open
         and prev1_low >= prev1_ema25
         and pb_body_ratio <= 0.6
         and float(last["high"]) > prev1_high
@@ -288,7 +291,6 @@ def evaluate_signal(
         and dif_last < 0
         and green1
         and not (green1 and green2 and green3)
-        and prev1_close > prev1_open
         and prev1_high <= prev1_ema25
         and pb_body_ratio <= 0.6
         and float(last["low"]) < prev1_low
@@ -305,7 +307,7 @@ def evaluate_signal(
     if long_impulse:
         if abs(prev1_close - prev1_open) > impulse_leg * 0.60:
             return None
-        stop_price = max(swing_low, price - atr_val * 2.0)
+        stop_price = min(swing_low, price - atr_val * 2.0)
         risk_per_unit = price - stop_price
         if risk_per_unit <= 0:
             return None
@@ -314,13 +316,13 @@ def evaluate_signal(
         # Keep score for ranking while favoring early, clean pullbacks.
         h1_slope_strength = abs(h1_ema_last - h1_ema_prev) / max(atr_1h, 1e-9)
         pullback_quality = max(0.0, 0.65 - pb_body_ratio)
-        rr_vs_atr = risk_per_unit / max(atr_val, 1e-9)
+        impulse_strength = min(2.0, impulse_leg / max(atr_val * 2.0, 1e-9))
         volume_strength = vol_last / max(vol_avg5, 1e-9)
         late_penalty = max(0.0, (candle_range / atr_val) - 1.0)
         score = (
             min(3.0, h1_slope_strength * 20.0)
             + min(2.0, pullback_quality * 6.0)
-            + min(2.0, rr_vs_atr)
+            + impulse_strength
             + min(1.5, max(0.0, volume_strength - 1.0))
             - min(2.0, late_penalty)
             - min(1.5, max(0.0, (atr_val / atr_avg - 1.3) * 3.0))
@@ -350,7 +352,7 @@ def evaluate_signal(
     if short_impulse:
         if abs(prev1_close - prev1_open) > impulse_leg * 0.60:
             return None
-        stop_price = min(swing_high, price + atr_val * 2.0)
+        stop_price = max(swing_high, price + atr_val * 2.0)
         risk_per_unit = stop_price - price
         if risk_per_unit <= 0:
             return None
@@ -358,13 +360,13 @@ def evaluate_signal(
             return None
         h1_slope_strength = abs(h1_ema_last - h1_ema_prev) / max(atr_1h, 1e-9)
         pullback_quality = max(0.0, 0.65 - pb_body_ratio)
-        rr_vs_atr = risk_per_unit / max(atr_val, 1e-9)
+        impulse_strength = min(2.0, impulse_leg / max(atr_val * 2.0, 1e-9))
         volume_strength = vol_last / max(vol_avg5, 1e-9)
         late_penalty = max(0.0, (candle_range / atr_val) - 1.0)
         score = (
             min(3.0, h1_slope_strength * 20.0)
             + min(2.0, pullback_quality * 6.0)
-            + min(2.0, rr_vs_atr)
+            + impulse_strength
             + min(1.5, max(0.0, volume_strength - 1.0))
             - min(2.0, late_penalty)
             - min(1.5, max(0.0, (atr_val / atr_avg - 1.3) * 3.0))
