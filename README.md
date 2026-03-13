@@ -33,9 +33,12 @@ Entry filters include:
 - M15 trend alignment:
   - LONG: `EMA7 > EMA25` and `DIF > 0`
   - SHORT: `EMA7 < EMA25` and `DIF < 0`
+- MACD histogram expanding in trade direction:
+  - LONG: current histogram bar `> previous histogram bar`
+  - SHORT: current histogram bar `< previous histogram bar`
 - Structured small pullback requirement:
   - only `1` or `2` opposite candles allowed
-  - pullback candle body must be small (`body/range <= 0.6`)
+  - **all** pullback candles must have `body/range <= 0.6` (both candles validated for 2-candle pullbacks)
   - LONG pullback low must hold above EMA25
   - SHORT pullback high must hold below EMA25
 - Early entry trigger:
@@ -43,14 +46,19 @@ Entry filters include:
   - SHORT: current candle breaks pullback low and closes below pullback close
 - Late-entry blockers:
   - reject if current range `> 1.6 * ATR`
-  - reject if distance from EMA7 `> 0.8%`
+  - reject if distance from EMA7 `> 0.3 * ATR`
   - reject if current `body/range > 0.85`
 - Volume quality gate:
-  - current volume must be at least `0.9 * avg volume(5)`
+  - current volume must be at least `1.3 * avg volume(5)` (strong confirmation required)
 - Anti-chop range filter:
-  - reject if EMA7/EMA25 crossed more than `2` times over last `15` candles
-- Score-based ranking:
-  - every valid signal gets a numeric `score`
+  - reject if EMA7/EMA25 crossed `3` or more times over last `15` candles
+- Score-based ranking (minimum `3.0` to pass):
+  - `h1_slope_strength`: 1H EMA50 momentum (0–3 pts)
+  - `pullback_quality`: cleaner/smaller pullback body (0–2 pts)
+  - `rr_vs_atr`: risk distance in ATR units (0–2 pts)
+  - `volume_strength`: volume boost above average (0–1.5 pts)
+  - `late_penalty`: penalizes large entry candles (up to −2 pts)
+  - `atr_regime_penalty`: penalizes high-volatility regimes where ATR > 1.3× its 20-bar average (up to −1.5 pts)
   - the engine sorts signals and executes only the top score each cycle
 
 ## Architecture

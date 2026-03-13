@@ -224,6 +224,10 @@ def evaluate_signal(
         prev2["volume"],
         prev2["open"],
         prev2["close"],
+        prev2["high"],
+        prev2["low"],
+        last["hist"],
+        prev1["hist"],
         prev3["open"],
         prev3["close"],
         h1_last["ema50"],
@@ -269,8 +273,7 @@ def evaluate_signal(
 
     ema7_last = float(last["ema7"])
     ema25_last = float(last["ema25"])
-    ema_distance_pct = abs(price - ema7_last) / price if price > 0 else 0.0
-    if ema_distance_pct > 0.008:
+    if abs(price - ema7_last) > atr_val * 0.3:
         return None
 
     body = abs(float(last["close"] - last["open"]))
@@ -281,7 +284,7 @@ def evaluate_signal(
     # Volume filter.
     vol_avg5 = float(last["vol_avg5_prev"] or 0.0)
     vol_last = float(last["volume"])
-    vol_confirm_ok = vol_avg5 > 0 and vol_last >= (vol_avg5 * 0.9)
+    vol_confirm_ok = vol_avg5 > 0 and vol_last >= (vol_avg5 * 1.3)
     if not vol_confirm_ok:
         return None
 
@@ -293,12 +296,15 @@ def evaluate_signal(
 
     prev2_open = float(prev2["open"])
     prev2_close = float(prev2["close"])
+    prev2_high = float(prev2["high"])
+    prev2_low = float(prev2["low"])
     prev3_open = float(prev3["open"])
     prev3_close = float(prev3["close"])
 
     swing_w = m15.iloc[-(SWING_LOOKBACK + 1):-1]
     swing_low = float(swing_w["low"].min()) if not swing_w.empty else float(prev1["low"])
     swing_high = float(swing_w["high"].max()) if not swing_w.empty else float(prev1["high"])
+    impulse_leg = swing_high - swing_low
 
     dif_last = float(last["dif"])
 
@@ -314,6 +320,24 @@ def evaluate_signal(
     pb_body = abs(float(prev1_close - prev1_open))
     pb_body_ratio = (pb_body / pb_range) if pb_range > 0 else 1.0
 
+    # 2-candle pullback: validate second candle body ratio as well.
+    if red1 and red2:
+        pb2_range = abs(prev2_high - prev2_low)
+        pb2_body = abs(prev2_close - prev2_open)
+        pb2_body_ratio = pb2_body / pb2_range if pb2_range > 0 else 1.0
+        if pb2_body_ratio > 0.6:
+            return None
+    if green1 and green2:
+        pb2_range = abs(prev2_high - prev2_low)
+        pb2_body = abs(prev2_close - prev2_open)
+        pb2_body_ratio = pb2_body / pb2_range if pb2_range > 0 else 1.0
+        if pb2_body_ratio > 0.6:
+            return None
+
+    # MACD histogram expanding in the direction of the trade.
+    hist_expanding_long = float(last["hist"]) > float(prev1["hist"])
+    hist_expanding_short = float(last["hist"]) < float(prev1["hist"])
+
     # Early trigger: break pullback candle high/low, no giant breakout required.
     long_impulse = (
         bias_long
@@ -327,6 +351,7 @@ def evaluate_signal(
         and pb_body_ratio <= 0.6
         and float(last["high"]) > prev1_high
         and price > prev1_close
+        and hist_expanding_long
     )
     short_impulse = (
         bias_short
@@ -340,6 +365,7 @@ def evaluate_signal(
         and pb_body_ratio <= 0.6
         and float(last["low"]) < prev1_low
         and price < prev1_close
+        and hist_expanding_short
     )
 
     breakout_ts = last.get("close_time")
@@ -349,9 +375,13 @@ def evaluate_signal(
         breakout_time = str(breakout_ts)
 
     if long_impulse:
+        if abs(prev1_close - prev1_open) > impulse_leg * 0.60:
+            return None
         stop_price = swing_low
         risk_per_unit = price - stop_price
         if risk_per_unit <= 0:
+            return None
+        if risk_per_unit < atr_val * 0.5:
             return None
         # Keep score for ranking while favoring early, clean pullbacks.
         h1_slope_strength = abs(h1_ema_last - h1_ema_prev) / max(abs(h1_ema_prev), 1e-9)
@@ -359,16 +389,17 @@ def evaluate_signal(
         rr_vs_atr = risk_per_unit / max(atr_val, 1e-9)
         volume_strength = vol_last / max(vol_avg5, 1e-9)
         late_penalty = max(0.0, (candle_range / atr_val) - 1.0)
-        ema_penalty = max(0.0, (ema_distance_pct - 0.004) * 100.0)
         score = (
             min(3.0, h1_slope_strength * 2500.0)
             + min(2.0, pullback_quality * 6.0)
             + min(2.0, rr_vs_atr)
             + min(1.5, max(0.0, volume_strength - 1.0))
             - min(2.0, late_penalty)
-            - min(1.5, ema_penalty)
+            - min(1.5, max(0.0, (atr_val / atr_avg - 1.3) * 3.0))
         )
         score = round(max(0.0, score), 2)
+        if score < 3.0:
+            return None
         return {
             "side": "BUY",
             "price": price,
@@ -389,25 +420,30 @@ def evaluate_signal(
         }
 
     if short_impulse:
+        if abs(prev1_close - prev1_open) > impulse_leg * 0.60:
+            return None
         stop_price = swing_high
         risk_per_unit = stop_price - price
         if risk_per_unit <= 0:
+            return None
+        if risk_per_unit < atr_val * 0.5:
             return None
         h1_slope_strength = abs(h1_ema_last - h1_ema_prev) / max(abs(h1_ema_prev), 1e-9)
         pullback_quality = max(0.0, 0.65 - pb_body_ratio)
         rr_vs_atr = risk_per_unit / max(atr_val, 1e-9)
         volume_strength = vol_last / max(vol_avg5, 1e-9)
         late_penalty = max(0.0, (candle_range / atr_val) - 1.0)
-        ema_penalty = max(0.0, (ema_distance_pct - 0.004) * 100.0)
         score = (
             min(3.0, h1_slope_strength * 2500.0)
             + min(2.0, pullback_quality * 6.0)
             + min(2.0, rr_vs_atr)
             + min(1.5, max(0.0, volume_strength - 1.0))
             - min(2.0, late_penalty)
-            - min(1.5, ema_penalty)
+            - min(1.5, max(0.0, (atr_val / atr_avg - 1.3) * 3.0))
         )
         score = round(max(0.0, score), 2)
+        if score < 3.0:
+            return None
         return {
             "side": "SELL",
             "price": price,
