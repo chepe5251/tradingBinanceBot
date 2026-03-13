@@ -859,10 +859,19 @@ def main() -> None:
         level_state = {
             "loss_l1_done": False,
             "loss_l2_done": False,
+            "loss_l3_done": False,
+            "loss_l4_done": False,
+            "loss_l5_done": False,
             "loss_l1_attempts": 0,
             "loss_l2_attempts": 0,
+            "loss_l3_attempts": 0,
+            "loss_l4_attempts": 0,
+            "loss_l5_attempts": 0,
             "loss_l1_next_try_ts": 0.0,
             "loss_l2_next_try_ts": 0.0,
+            "loss_l3_next_try_ts": 0.0,
+            "loss_l4_next_try_ts": 0.0,
+            "loss_l5_next_try_ts": 0.0,
         }
         def price_fn() -> float | None:
             """Provide live mark price to the protection monitor."""
@@ -888,7 +897,13 @@ def main() -> None:
             def scale_fn(state: dict) -> dict | None:
                 """Evaluate and execute loss-based scaling stages while preserving protections."""
                 now_ts = time.time()
-                if level_state["loss_l1_done"] and level_state["loss_l2_done"]:
+                if (
+                    level_state["loss_l1_done"]
+                    and level_state["loss_l2_done"]
+                    and level_state["loss_l3_done"]
+                    and level_state["loss_l4_done"]
+                    and level_state["loss_l5_done"]
+                ):
                     return None
                 df_scale = stream.get_dataframe(symbol, settings.main_interval)
                 if df_scale.empty or len(df_scale) < max(settings.ema_mid + 2, 10):
@@ -938,7 +953,14 @@ def main() -> None:
                         )
 
                 # Anti-liquidation guard before completing all scale stages.
-                if not (level_state["loss_l1_done"] and level_state["loss_l2_done"]) and risk_ref > 0:
+                _all_levels_done = (
+                    level_state["loss_l1_done"]
+                    and level_state["loss_l2_done"]
+                    and level_state["loss_l3_done"]
+                    and level_state["loss_l4_done"]
+                    and level_state["loss_l5_done"]
+                )
+                if not _all_levels_done and risk_ref > 0:
                     adverse = (entry_ref - mark) if side == "BUY" else (mark - entry_ref)
                     anti_liq_r = max(float(settings.anti_liq_trigger_r), 1.1)
                     if adverse >= (anti_liq_r * risk_ref):
@@ -989,6 +1011,33 @@ def main() -> None:
                     level_key = "loss_l2"
                     trigger_label = "100%"
                     add_margin = margin_initial * 2.0
+                elif (
+                    level_state["loss_l2_done"]
+                    and not level_state["loss_l3_done"]
+                    and now_ts >= float(level_state.get("loss_l3_next_try_ts", 0.0))
+                    and floating_loss >= (2.0 * margin_initial)
+                ):
+                    level_key = "loss_l3"
+                    trigger_label = "200%"
+                    add_margin = margin_initial * 4.0
+                elif (
+                    level_state["loss_l3_done"]
+                    and not level_state["loss_l4_done"]
+                    and now_ts >= float(level_state.get("loss_l4_next_try_ts", 0.0))
+                    and floating_loss >= (4.0 * margin_initial)
+                ):
+                    level_key = "loss_l4"
+                    trigger_label = "400%"
+                    add_margin = margin_initial * 8.0
+                elif (
+                    level_state["loss_l4_done"]
+                    and not level_state["loss_l5_done"]
+                    and now_ts >= float(level_state.get("loss_l5_next_try_ts", 0.0))
+                    and floating_loss >= (8.0 * margin_initial)
+                ):
+                    level_key = "loss_l5"
+                    trigger_label = "800%"
+                    add_margin = margin_initial * 16.0
                 else:
                     return None
 
