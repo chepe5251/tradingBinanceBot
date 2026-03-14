@@ -46,11 +46,14 @@ def _get_available_balance(client: Client) -> float:
 
 
 def _has_any_position(client: Client) -> bool:
-    """Return True if there is any open position or any open order.
+    """Return True if there is any open position or a pending entry order.
 
-    Defaults to True (block) on any API error so a second entry is never
-    accidentally opened due to a transient failure.
+    TP/SL orders (TAKE_PROFIT_MARKET, STOP_MARKET) are ignored because they
+    are always present while a position is monitored.  Only unfilled entry
+    orders (LIMIT, MARKET) count as a blocker.
+    Defaults to True (block) on any API error.
     """
+    _PROTECTION_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET", "TRAILING_STOP_MARKET"}
     try:
         positions = client.futures_position_information()
         for p in positions:
@@ -59,8 +62,10 @@ def _has_any_position(client: Client) -> bool:
     except Exception:
         return True
     try:
-        if client.futures_get_open_orders():
-            return True
+        open_orders = client.futures_get_open_orders()
+        for o in open_orders:
+            if o.get("type") not in _PROTECTION_TYPES:
+                return True  # pending entry order
     except Exception:
         return True
     return False
