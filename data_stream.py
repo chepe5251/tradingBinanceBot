@@ -218,6 +218,12 @@ class MarketDataStream:
         self._last_event_wall = time.time()
         self._last_event_ts = int(k.get("T", 0)) if k.get("T") else None
         self._last_event_symbol = symbol
+
+        # Only update cache and trigger callbacks on closed candles.
+        # Intra-candle updates are unused by strategy and monitor logic.
+        if not k.get("x"):
+            return
+
         row = _kline_to_row(k)
         with self._lock:
             series = self._candles[interval][symbol]
@@ -225,11 +231,10 @@ class MarketDataStream:
                 series[-1] = row
             else:
                 series.append(row)
-        if k.get("x"):
-            self._last_closed_ts = int(k.get("T", 0)) if k.get("T") else None
-            self._last_close_symbol = symbol
+        self._last_closed_ts = int(k.get("T", 0)) if k.get("T") else None
+        self._last_close_symbol = symbol
 
-        if interval == self.main_interval and self._on_main_close and k.get("x"):
+        if interval == self.main_interval and self._on_main_close:
             self._on_main_close(symbol)
 
     def _start_stream(self) -> None:
