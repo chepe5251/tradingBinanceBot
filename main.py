@@ -153,11 +153,6 @@ def _ema(series, period: int):
     return series.ewm(span=period, adjust=False).mean()
 
 
-def _ema_series(series, period: int):
-    """Alias helper for EMA computations used in context checks."""
-    return series.ewm(span=period, adjust=False).mean()
-
-
 def _context_direction(df, ema_period: int) -> str | None:
     """Infer directional bias from close price versus EMA."""
     if df.empty or len(df) < ema_period:
@@ -357,7 +352,7 @@ def _layered_signal_check(
     price = float(signal.get("price") or 0.0)
     if price <= 0 or atr_val <= 0:
         return False, "atr_o_precio_invalido"
-    ema_fast_series = _ema_series(df["close"], ema_fast_period)
+    ema_fast_series = _ema(df["close"], ema_fast_period)
     ema_fast_last = float(ema_fast_series.iloc[-1])
     distance_fast_atr = abs(price - ema_fast_last) / atr_val if atr_val > 0 else 999.0
     last = df.iloc[-1]
@@ -1205,8 +1200,8 @@ def main() -> None:
                 if df.empty or len(df) < max(settings.ema_mid, settings.ema_fast, settings.volume_avg_window + 2, 4):
                     return False, "no_data"
 
-                ema20 = _ema_series(df["close"], settings.ema_fast)
-                ema50 = _ema_series(df["close"], settings.ema_mid)
+                ema20 = _ema(df["close"], settings.ema_fast)
+                ema50 = _ema(df["close"], settings.ema_mid)
                 last = df.iloc[-1]
                 prev1 = df.iloc[-2]
                 prev2 = df.iloc[-3]
