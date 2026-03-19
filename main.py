@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 
 from binance import Client
 
+import db
 from config import from_env
 from data_stream import MarketDataStream
 from strategy import evaluate_signal
@@ -441,6 +442,7 @@ def _format_trade_event_message(symbol: str, title: str, detail: str) -> str:
 def main() -> None:
     """Bootstrap services and run the bot heartbeat loop."""
     settings = from_env()
+    db.init_db()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -537,7 +539,7 @@ def main() -> None:
             if not _has_any_position(trade_client):
                 _cleanup_open_orders(trade_client, symbols, logger)
             else:
-                logger.info("Open position detected; skipping open-order cleanup.")
+                logger.info("Open position detected; will attempt orphan recovery after stream starts.")
         except Exception as exc:
             logger.warning("Open-order cleanup failed: %s", exc)
 
@@ -552,6 +554,210 @@ def main() -> None:
             _send_telegram_message(telegram_token, telegram_chat_id, message)
         except Exception as exc:
             logger.warning("Telegram send failed: %s", exc)
+
+    def _resume_orphaned_position() -> None:
+        """Detect and resume monitoring of a position opened before this boot.
+
+        If Binance has an open position that the bot doesn't know about, this
+        function reconstructs enough state to place/find TP+SL orders and
+        start the protection monitor thread.  Only the first open position
+        found is recovered; the bot still enforces one-position-at-a-time.
+        """
+        _PROTECTION_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET", "TRAILING_STOP_MARKET"}
+        try:
+            positions = trade_client.futures_position_information()
+        except Exception as exc:
+            logger.warning("Orphan recovery: failed to fetch positions: %s", exc)
+            return
+
+        orphan = None
+        for p in positions:
+            try:
+                amt = float(p.get("positionAmt", 0))
+            except Exception:
+                continue
+            if abs(amt) > 0:
+                orphan = p
+                break
+
+        if orphan is None:
+            return
+
+        symbol = orphan.get("symbol", "")
+        if not symbol or symbol not in set(symbols):
+            logger.warning("Orphan recovery: symbol %s not in universe, skipping.", symbol)
+            return
+
+        try:
+            qty = abs(float(orphan.get("positionAmt", 0)))
+            entry_price = float(orphan.get("entryPrice", 0))
+            side = "BUY" if float(orphan.get("positionAmt", 0)) > 0 else "SELL"
+        except Exception as exc:
+            logger.warning("Orphan recovery: could not parse position data: %s", exc)
+            return
+
+        if qty <= 0 or entry_price <= 0:
+            logger.warning("Orphan recovery: invalid qty=%.4f entry=%.4f, skipping.", qty, entry_price)
+            return
+
+        logger.info(
+            "Orphan recovery: resuming %s side=%s qty=%.4f entry=%.4f",
+            symbol, side, qty, entry_price,
+        )
+
+        # Estimate SL and TP from existing orders, falling back to ATR.
+        sl_price: float | None = None
+        tp_price: float | None = None
+        try:
+            open_orders = trade_client.futures_get_open_orders(symbol=symbol)
+            for o in open_orders:
+                ot = o.get("type", "")
+                sp = float(o.get("stopPrice", 0) or 0)
+                if sp <= 0:
+                    continue
+                if ot == "STOP_MARKET" and sl_price is None:
+                    sl_price = sp
+                elif ot == "TAKE_PROFIT_MARKET" and tp_price is None:
+                    tp_price = sp
+        except Exception as exc:
+            logger.warning("Orphan recovery: could not fetch open orders: %s", exc)
+
+        df_orphan = stream.get_dataframe(symbol, settings.main_interval)
+        atr_orphan = _calc_atr(df_orphan, settings.atr_period) if not df_orphan.empty else 0.0
+
+        if sl_price is None:
+            sl_price = (
+                entry_price - settings.stop_atr_mult * atr_orphan
+                if side == "BUY"
+                else entry_price + settings.stop_atr_mult * atr_orphan
+            )
+        if tp_price is None:
+            risk_est = abs(entry_price - sl_price)
+            tp_price = (
+                entry_price + risk_est * max(float(settings.tp_rr), 1.8)
+                if side == "BUY"
+                else entry_price - risk_est * max(float(settings.tp_rr), 1.8)
+            )
+
+        executor = get_executor(symbol)
+        qty_rounded = executor.round_qty(qty)
+        risk_distance = abs(entry_price - sl_price)
+        breakeven_pct = max(risk_distance / entry_price, 0.005) if entry_price > 0 else 0.005
+
+        orphan_trade_state = {
+            "entry_price": entry_price,
+            "qty": qty_rounded,
+            "sl": sl_price,
+            "tp": tp_price,
+            "risk_distance": risk_distance,
+            "breakeven_trigger_pct": breakeven_pct,
+            "anchor_entry_price": entry_price,
+            "anchor_risk_distance": risk_distance,
+            "tp_risk_cap": risk_distance,
+            "db_trade_id": None,
+        }
+        orphan_level_state = {
+            "loss_l1_done": True,
+            "loss_l2_done": True,
+            "loss_l3_done": True,
+            "loss_l1_attempts": 0,
+            "loss_l2_attempts": 0,
+            "loss_l3_attempts": 0,
+            "loss_l1_next_try_ts": 0.0,
+            "loss_l2_next_try_ts": 0.0,
+            "loss_l3_next_try_ts": 0.0,
+        }
+
+        client_id_prefix = f"{symbol}-orphan-{int(time.time() * 1000)}"
+
+        def _orphan_price_fn() -> float | None:
+            return _get_mark_price(trade_client, symbol)
+
+        def _orphan_atr_fn() -> float | None:
+            _df = stream.get_dataframe(symbol, settings.main_interval)
+            return _calc_atr(_df, settings.atr_period)
+
+        def _orphan_on_event(kind: str, new_sl: float) -> None:
+            trades_logger.info("%s %s new_sl=%.4f (orphan)", kind, symbol, new_sl)
+
+        def _orphan_monitor() -> None:
+            attempts = 0
+            tp_ref = sl_ref = None
+            position_wait_deadline = time.time() + 10.0
+
+            while True:
+                try:
+                    has_pos = executor.has_open_position()
+                except Exception:
+                    has_pos = False
+                if not has_pos:
+                    if time.time() < position_wait_deadline:
+                        time.sleep(0.5)
+                        continue
+                    trades_logger.info("orphan %s reason=position_gone", symbol)
+                    return
+
+                try:
+                    existing_tp, existing_sl = executor.get_protection_refs(
+                        side, client_id_prefix=client_id_prefix
+                    )
+                    if existing_tp and existing_sl:
+                        tp_ref, sl_ref = existing_tp, existing_sl
+                        break
+                    tp_ref, sl_ref = executor.place_tp_sl(
+                        side,
+                        float(orphan_trade_state["tp"]),
+                        float(orphan_trade_state["sl"]),
+                        float(orphan_trade_state["qty"]),
+                        client_id_prefix=client_id_prefix,
+                    )
+                    if tp_ref and sl_ref:
+                        break
+                except Exception as exc:
+                    logger.error("Orphan TP/SL placement failed %s: %s", symbol, exc)
+
+                attempts += 1
+                time.sleep(2)
+                if attempts >= 15:
+                    trades_logger.info("critical %s reason=orphan_tp_sl_fail", symbol)
+                    return
+
+            trades_logger.info(
+                "orphan_resumed %s side=%s price=%.4f qty=%.6f tp=%.4f sl=%.4f",
+                symbol, side, entry_price, qty_rounded,
+                float(orphan_trade_state["tp"]), float(orphan_trade_state["sl"]),
+            )
+
+            result, exit_price_val = executor.monitor_oco(
+                tp_ref,
+                sl_ref,
+                side=side,
+                entry_price=float(orphan_trade_state["entry_price"]),
+                tp_price=float(orphan_trade_state["tp"]),
+                sl_price=float(orphan_trade_state["sl"]),
+                qty=float(orphan_trade_state["qty"]),
+                atr=atr_orphan,
+                breakeven_trigger_pct=float(orphan_trade_state["breakeven_trigger_pct"]),
+                trail_mult=0.8,
+                trail_activation_pct=max(settings.trailing_activation_pct, 0.01),
+                price_fn=_orphan_price_fn,
+                atr_fn=_orphan_atr_fn,
+                on_event=_orphan_on_event,
+                scale_fn=None,
+                safety_check_sec=2,
+                review_fn=None,
+                review_sec=7,
+                client_id_prefix=client_id_prefix,
+            )
+            final_entry = float(orphan_trade_state["entry_price"])
+            final_qty = float(orphan_trade_state["qty"])
+            pnl = (exit_price_val - final_entry) * final_qty
+            if side == "SELL":
+                pnl = -pnl
+            risk.update_trade(pnl, datetime.now(timezone.utc))
+            trades_logger.info("orphan_exit %s result=%s pnl=%.4f", symbol, result, pnl)
+
+        threading.Thread(target=_orphan_monitor, daemon=True, name=f"orphan-{symbol}").start()
 
     def on_main_close(symbol: str) -> None:
         """Main evaluation callback executed on each closed main-interval candle."""
@@ -883,6 +1089,12 @@ def main() -> None:
         )
         filled_qty = executor.round_qty(filled_qty)
 
+        try:
+            _db_trade_id = db.record_entry(symbol, side, entry_price, filled_qty, tp, sl_common)
+        except Exception as _db_exc:
+            logger.warning("db.record_entry failed: %s", _db_exc)
+            _db_trade_id = None
+
         trade_state = {
             "entry_price": entry_price,
             "qty": filled_qty,
@@ -895,6 +1107,7 @@ def main() -> None:
             "anchor_risk_distance": risk_distance,
             # TP should not be inflated by the widened emergency SL.
             "tp_risk_cap": tp_risk_cap,
+            "db_trade_id": _db_trade_id,
         }
 
 
@@ -902,18 +1115,12 @@ def main() -> None:
             "loss_l1_done": False,
             "loss_l2_done": False,
             "loss_l3_done": False,
-            "loss_l4_done": False,
-            "loss_l5_done": False,
             "loss_l1_attempts": 0,
             "loss_l2_attempts": 0,
             "loss_l3_attempts": 0,
-            "loss_l4_attempts": 0,
-            "loss_l5_attempts": 0,
             "loss_l1_next_try_ts": 0.0,
             "loss_l2_next_try_ts": 0.0,
             "loss_l3_next_try_ts": 0.0,
-            "loss_l4_next_try_ts": 0.0,
-            "loss_l5_next_try_ts": 0.0,
         }
         def price_fn() -> float | None:
             """Provide live mark price to the protection monitor."""
@@ -943,8 +1150,6 @@ def main() -> None:
                     level_state["loss_l1_done"]
                     and level_state["loss_l2_done"]
                     and level_state["loss_l3_done"]
-                    and level_state["loss_l4_done"]
-                    and level_state["loss_l5_done"]
                 ):
                     return None
                 df_scale = stream.get_dataframe(symbol, settings.main_interval)
@@ -1047,24 +1252,6 @@ def main() -> None:
                     level_key = "loss_l3"
                     trigger_label = "200%"
                     add_margin = margin_initial * 4.0
-                elif (
-                    level_state["loss_l3_done"]
-                    and not level_state["loss_l4_done"]
-                    and now_ts >= float(level_state.get("loss_l4_next_try_ts", 0.0))
-                    and floating_loss >= (4.0 * margin_initial)
-                ):
-                    level_key = "loss_l4"
-                    trigger_label = "400%"
-                    add_margin = margin_initial * 8.0
-                elif (
-                    level_state["loss_l4_done"]
-                    and not level_state["loss_l5_done"]
-                    and now_ts >= float(level_state.get("loss_l5_next_try_ts", 0.0))
-                    and floating_loss >= (8.0 * margin_initial)
-                ):
-                    level_key = "loss_l5"
-                    trigger_label = "800%"
-                    add_margin = margin_initial * 16.0
                 else:
                     return None
 
@@ -1122,13 +1309,11 @@ def main() -> None:
                 new_risk = abs(new_entry - sl_ref_price)
                 if new_risk <= 0:
                     return None
-                tp_risk_cap_state = float(trade_state.get("tp_risk_cap", 0.0) or 0.0)
-                tp_risk_basis = min(new_risk, tp_risk_cap_state) if tp_risk_cap_state > 0 else new_risk
                 tp_rr_effective = max(float(settings.tp_rr), 1.8)
                 new_tp = (
-                    new_entry + (tp_rr_effective * tp_risk_basis)
+                    new_entry + (tp_rr_effective * new_risk)
                     if side == "BUY"
-                    else new_entry - (tp_rr_effective * tp_risk_basis)
+                    else new_entry - (tp_rr_effective * new_risk)
                 )
 
                 new_tp_ref = None
@@ -1164,6 +1349,13 @@ def main() -> None:
                 trade_state["tp"] = new_tp
                 trade_state["risk_distance"] = new_risk
                 # Keep existing break-even logic; do not force break-even movement after repurchase.
+
+                _tid = trade_state.get("db_trade_id")
+                if _tid is not None:
+                    try:
+                        db.record_scale(_tid, new_entry, new_qty, new_tp)
+                    except Exception as _db_exc:
+                        trades_logger.info("db.record_scale failed: %s", _db_exc)
 
                 return {
                     "entry_price": new_entry,
@@ -1317,13 +1509,25 @@ def main() -> None:
                     pnl = -pnl
                 risk.update_trade(pnl, datetime.now(timezone.utc))
                 trades_logger.info("exit %s result=%s pnl=%.4f", symbol, result, pnl)
+                _tid = trade_state.get("db_trade_id")
+                if _tid is not None:
+                    try:
+                        db.record_exit(_tid, exit_price, result, pnl)
+                    except Exception as _db_exc:
+                        trades_logger.info("db.record_exit failed: %s", _db_exc)
                 return
             trades_logger.info("exit %s result=%s pnl=0.0", symbol, result)
             return
         threading.Thread(target=protect_and_monitor, daemon=True).start()
 
-    logger.info("Starting WebSocket stream...")
-    stream.start(on_main_close)
+    if not settings.use_paper_trading:
+        try:
+            _resume_orphaned_position()
+        except Exception as exc:
+            logger.warning("Orphan recovery failed: %s", exc)
+
+    logger.info("Starting scheduler...")
+    stream.start_scheduler(on_main_close)
 
     try:
         last_heartbeat = time.time()
@@ -1332,14 +1536,12 @@ def main() -> None:
             if time.time() - last_heartbeat >= settings.log_heartbeat_sec:
                 st = stream.status()
                 logger.info(
-                    "Heartbeat: bot alive | events=%s last_event=%s last_close=%s last_event_symbol=%s last_close_symbol=%s",
+                    "Heartbeat: bot alive | polls=%s last_close=%s next_close_in=%.0fs scheduler=%s",
                     st.get("event_count"),
-                    st.get("last_event_ts"),
                     st.get("last_closed_ts"),
-                    st.get("last_event_symbol"),
-                    st.get("last_close_symbol"),
+                    st.get("next_close_in_sec", 0),
+                    st.get("scheduler_alive"),
                 )
-                stream.restart_if_stale(max_idle_sec=30)
                 last_heartbeat = time.time()
     except KeyboardInterrupt:
         logger.info("Stopping...")

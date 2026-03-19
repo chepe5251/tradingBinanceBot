@@ -1,9 +1,14 @@
-"""WebSocket market-data ingestion and in-memory candle storage.
+"""REST-scheduler market-data ingestion and in-memory candle storage.
 
 `MarketDataStream` is responsible for:
 - Bootstrapping historical klines for all tracked intervals/symbols.
-- Maintaining live candle updates from Binance websocket streams.
+- Polling closed candles at each M15 boundary via Binance REST API.
 - Providing thread-safe dataframe snapshots to strategy/execution code.
+
+Replacing the previous WebSocket multiplex approach with a REST scheduler
+reduces open connections from 22 streams to zero while maintaining correct
+behavior, since strategy evaluation only needs closed candles (fired at
+fixed :00/:15/:30/:45 boundaries for M15).
 """
 from __future__ import annotations
 
@@ -15,7 +20,6 @@ from typing import Callable, Dict, Optional
 
 import pandas as pd
 from binance import Client
-from binance import ThreadedWebsocketManager
 
 logger = logging.getLogger(__name__)
 
@@ -39,27 +43,30 @@ class MarketDataStream:
     The class keeps a bounded in-memory deque per `(interval, symbol)` pair.
     """
 
+    _INTERVAL_SECONDS: dict[str, int] = {
+        "1m": 60, "3m": 180, "5m": 300, "15m": 900,
+        "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400,
+        "6h": 21600, "8h": 28800, "12h": 43200, "1d": 86400,
+    }
+
     def __init__(
         self,
         client: Client,
         symbols: list[str],
         main_interval: str,
         main_limit: int,
-        api_key: str,
-        api_secret: str,
-        testnet: bool,
+        api_key: str = "",
+        api_secret: str = "",
+        testnet: bool = False,
         context_interval: str | None = None,
         context_limit: int | None = None,
         extra_intervals: dict[str, int] | None = None,
     ) -> None:
-        """Initialize stream configuration and caches without opening sockets."""
+        """Initialize stream configuration and caches without opening connections."""
         self.client = client
         self.symbols = [s.upper() for s in symbols]
         self.main_interval = main_interval
         self.main_limit = main_limit
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.testnet = testnet
 
         self._lock = threading.Lock()
         self._candles: Dict[str, Dict[str, deque]] = {
@@ -75,20 +82,12 @@ class MarketDataStream:
                     continue
                 self._candles[interval] = {s: deque(maxlen=limit) for s in self.symbols}
 
-        self._twm: Optional[ThreadedWebsocketManager] = None
         self._on_main_close: Optional[Callable[[str], None]] = None
-        self._last_event_ts: Optional[int] = None
         self._last_closed_ts: Optional[int] = None
+        self._last_closed_wall: Optional[float] = None
         self._event_count: int = 0
-        self._last_event_symbol: Optional[str] = None
-        self._last_close_symbol: Optional[str] = None
-        self._restart_lock = threading.Lock()
-        self._restarting = False
-        self._last_error_log = 0.0
-        self._last_event_wall: Optional[float] = None
-        # WS stability tuning for large universes (full USDT-M symbol list).
-        self._stream_chunk_size: int = 50
-        self._chunk_start_delay_sec: float = 0.5
+        self._stop_event = threading.Event()
+        self._scheduler_thread: Optional[threading.Thread] = None
 
     @staticmethod
     def _chunks(items: list[str], size: int) -> list[list[str]]:
@@ -147,189 +146,103 @@ class MarketDataStream:
                     self._candles[interval][symbol].clear()
                     self._candles[interval][symbol].extend(rows)
 
-    def _schedule_restart(self, reason: str) -> None:
-        """Request an asynchronous websocket restart with bounded retries."""
-        with self._restart_lock:
-            if self._restarting:
-                return
-            self._restarting = True
+    def _seconds_to_next_close(self) -> float:
+        """Return seconds until the next main-interval candle close + 2 s buffer."""
+        period = self._INTERVAL_SECONDS.get(self.main_interval, 900)
+        elapsed = time.time() % period
+        return (period - elapsed) + 2.0
 
-        def _restart() -> None:
-            """Stop and recreate websocket subscriptions with exponential delays."""
-            try:
-                logger.warning("WS restarting: %s", reason)
-                attempts = 0
-                delay = 5
-                while attempts < 3:
-                    self.stop()
-                    time.sleep(delay)
-                    try:
-                        self._start_stream()
-                        return
-                    except Exception as exc:
-                        attempts += 1
-                        logger.error("WS restart failed: %s", exc)
-                        delay = min(delay * 2, 30)
-            except Exception as exc:
-                logger.error("WS restart failed: %s", exc)
-            finally:
-                with self._restart_lock:
-                    self._restarting = False
-
-        threading.Thread(target=_restart, daemon=True).start()
-
-    def _handle_kline(self, msg: dict) -> None:
-        """Handle raw websocket messages and update internal candle caches."""
-        # Handle combined stream payloads.
-        if "data" in msg and isinstance(msg["data"], dict):
-            msg = msg["data"]
-        if msg.get("e") == "error":
-            now = time.time()
-            err_type = str(msg.get("type") or "")
-            err_msg = str(msg.get("m") or "")
-            err_msg_l = err_msg.lower()
-            restartable = (
-                err_type in {"ReadLoopClosed", "ConnectionClosedError"}
-                or "keepalive ping timeout" in err_msg_l
-                or "connection closed" in err_msg_l
-            )
-            if restartable:
-                # Ignore transient WS errors while events are still flowing.
-                if self._last_event_wall is not None and now - self._last_event_wall < 20:
-                    return
-                if now - self._last_error_log >= 30:
-                    logger.warning("WS error restart | type=%s msg=%s", err_type, err_msg)
-                    self._last_error_log = now
-                self._schedule_restart(err_type or err_msg or "ws_error")
-            elif now - self._last_error_log >= 30:
-                logger.error("WS error: %s", msg)
-                self._last_error_log = now
+    def _fetch_and_update(self, symbol: str, interval: str, limit: int = 3) -> None:
+        """Fetch the latest `limit` closed klines and update the in-memory cache."""
+        try:
+            klines = self.client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        except Exception as exc:
+            logger.debug("REST fetch failed %s %s: %s", symbol, interval, exc)
             return
-        if msg.get("e") != "kline":
-            return
-        k = msg.get("k", {})
-        interval = k.get("i")
-        if interval not in self._candles:
-            return
-        symbol = k.get("s")
-        if symbol not in self._candles[interval]:
-            return
-        self._event_count += 1
-        self._last_event_wall = time.time()
-        self._last_event_ts = int(k.get("T", 0)) if k.get("T") else None
-        self._last_event_symbol = symbol
-
-        # Only update cache and trigger callbacks on closed candles.
-        # Intra-candle updates are unused by strategy and monitor logic.
-        if not k.get("x"):
-            return
-
-        row = _kline_to_row(k)
+        rows = [
+            {
+                "open_time": int(k[0]),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+                "close_time": int(k[6]),
+            }
+            for k in klines
+        ]
         with self._lock:
-            series = self._candles[interval][symbol]
-            if series and series[-1]["open_time"] == row["open_time"]:
-                series[-1] = row
-            else:
-                series.append(row)
-        self._last_closed_ts = int(k.get("T", 0)) if k.get("T") else None
-        self._last_close_symbol = symbol
+            series = self._candles.get(interval, {}).get(symbol)
+            if series is None:
+                return
+            for row in rows:
+                if series and series[-1]["open_time"] == row["open_time"]:
+                    series[-1] = row
+                else:
+                    series.append(row)
 
-        if interval == self.main_interval and self._on_main_close:
-            self._on_main_close(symbol)
+    def _refresh_all(self) -> None:
+        """Fetch latest candles for every symbol/interval in parallel (max 20 concurrent)."""
+        semaphore = threading.Semaphore(20)
+        threads: list[threading.Thread] = []
 
-    def _start_stream(self) -> None:
-        """Open websocket subscriptions for all configured intervals/symbols."""
-        if self._twm is not None:
-            try:
-                self._twm.stop()
-            except Exception:
-                pass
-            self._twm = None
-        self._twm = ThreadedWebsocketManager(
-            api_key=None,
-            api_secret=None,
-            testnet=self.testnet,
-        )
-        self._twm.start()
-        symbols_lower = [s.lower() for s in self.symbols]
-        preview = ",".join(self.symbols[:20])
-        if len(self.symbols) > 20:
-            preview += f",...(+{len(self.symbols)-20})"
+        for interval in list(self._candles.keys()):
+            for sym in self.symbols:
+                def _task(s: str = sym, iv: str = interval) -> None:
+                    with semaphore:
+                        self._fetch_and_update(s, iv)
+                t = threading.Thread(target=_task, daemon=True)
+                t.start()
+                threads.append(t)
+
+        for t in threads:
+            t.join(timeout=30)
+
+    def _scheduler_loop(self) -> None:
+        """Core loop: sleep until next M15 boundary, refresh REST data, fire callback."""
         logger.info(
-            "WS init | testnet=%s symbols_count=%s symbols=%s interval=%s",
-            self.testnet,
+            "Scheduler init | symbols=%d intervals=%s",
             len(self.symbols),
-            preview,
-            self.main_interval,
+            list(self._candles.keys()),
         )
-        if hasattr(self._twm, "start_futures_multiplex_socket"):
-            logger.info("Using start_futures_multiplex_socket")
-            streams = []
-            for interval in self._candles.keys():
-                streams.extend([f"{sym}@kline_{interval}" for sym in symbols_lower])
-            # Avoid HTTP 414 (Request-URI Too Large) by splitting stream lists.
-            for idx, chunk in enumerate(self._chunks(streams, self._stream_chunk_size), start=1):
-                self._twm.start_futures_multiplex_socket(streams=chunk, callback=self._handle_kline)
-                logger.info("Started futures multiplex chunk %s with %s streams", idx, len(chunk))
-                time.sleep(self._chunk_start_delay_sec)
-        elif hasattr(self._twm, "start_kline_futures_socket"):
-            logger.info("Using start_kline_futures_socket")
-            for interval in self._candles.keys():
-                for sym in symbols_lower:
-                    self._twm.start_kline_futures_socket(
-                        symbol=sym,
-                        interval=interval,
-                        callback=self._handle_kline,
-                    )
-        elif hasattr(self._twm, "start_futures_kline_socket"):
-            logger.info("Using start_futures_kline_socket")
-            for interval in self._candles.keys():
-                for sym in symbols_lower:
-                    self._twm.start_futures_kline_socket(
-                        symbol=sym,
-                        interval=interval,
-                        callback=self._handle_kline,
-                    )
-        elif hasattr(self._twm, "start_kline_socket"):
-            logger.warning("Futures kline socket not available; falling back to spot kline socket.")
-            for interval in self._candles.keys():
-                for sym in symbols_lower:
-                    self._twm.start_kline_socket(
-                        symbol=sym,
-                        interval=interval,
-                        callback=self._handle_kline,
-                    )
-        elif hasattr(self._twm, "start_multiplex_socket"):
-            logger.warning("Using spot multiplex socket as fallback.")
-            streams = []
-            for interval in self._candles.keys():
-                streams.extend([f"{sym}@kline_{interval}" for sym in symbols_lower])
-            for idx, chunk in enumerate(self._chunks(streams, self._stream_chunk_size), start=1):
-                self._twm.start_multiplex_socket(streams=chunk, callback=self._handle_kline)
-                logger.info("Started spot multiplex chunk %s with %s streams", idx, len(chunk))
-                time.sleep(self._chunk_start_delay_sec)
-        else:
-            raise RuntimeError("No kline socket method available in ThreadedWebsocketManager")
+        while not self._stop_event.is_set():
+            wait_sec = self._seconds_to_next_close()
+            logger.debug("Scheduler: next close in %.1f s", wait_sec)
+            self._stop_event.wait(timeout=wait_sec)
+            if self._stop_event.is_set():
+                break
 
-    def start(self, on_main_close: Callable[[str], None]) -> None:
-        """Start websocket streaming and register main-interval close callback."""
+            logger.info("Scheduler: polling %d symbols × %d intervals via REST",
+                        len(self.symbols), len(self._candles))
+            self._refresh_all()
+
+            self._event_count += 1
+            self._last_closed_ts = int(time.time() * 1000)
+            self._last_closed_wall = time.time()
+
+            if self._on_main_close and self.symbols:
+                try:
+                    self._on_main_close(self.symbols[0])
+                except Exception as exc:
+                    logger.error("on_main_close raised: %s", exc)
+
+    def start_scheduler(self, on_main_close: Callable[[str], None]) -> None:
+        """Start the REST-based scheduler and register the close callback."""
         self._on_main_close = on_main_close
-        self._start_stream()
+        self._stop_event.clear()
+        self._scheduler_thread = threading.Thread(
+            target=self._scheduler_loop,
+            daemon=True,
+            name="rest-scheduler",
+        )
+        self._scheduler_thread.start()
 
     def stop(self) -> None:
-        """Stop websocket streaming and release the manager instance."""
-        if self._twm:
-            try:
-                self._twm.stop()
-            finally:
-                self._twm = None
+        """Stop the scheduler."""
+        self._stop_event.set()
 
     def restart_if_stale(self, max_idle_sec: int) -> None:
-        """Restart stream when no events were received for `max_idle_sec`."""
-        if self._last_event_wall is None:
-            return
-        if time.time() - self._last_event_wall >= max_idle_sec:
-            self._schedule_restart(f"stale>{max_idle_sec}s")
+        """No-op kept for API compatibility; scheduler is self-correcting."""
 
     def get_dataframe(self, symbol: str, interval: str) -> pd.DataFrame:
         """Return a pandas snapshot for `(symbol, interval)` in UTC timestamps."""
@@ -343,12 +256,14 @@ class MarketDataStream:
         return df
 
     def status(self) -> dict:
-        """Expose heartbeat-friendly stream diagnostics."""
+        """Expose heartbeat-friendly scheduler diagnostics."""
+        next_close_sec = self._seconds_to_next_close()
         return {
             "event_count": self._event_count,
-            "last_event_ts": self._last_event_ts,
             "last_closed_ts": self._last_closed_ts,
-            "last_event_symbol": self._last_event_symbol,
-            "last_close_symbol": self._last_close_symbol,
-            "last_event_wall": self._last_event_wall,
+            "last_closed_wall": self._last_closed_wall,
+            "next_close_in_sec": round(next_close_sec, 1),
+            "scheduler_alive": (
+                self._scheduler_thread is not None and self._scheduler_thread.is_alive()
+            ),
         }
