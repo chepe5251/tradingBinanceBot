@@ -19,7 +19,6 @@ from urllib.request import Request, urlopen
 
 from binance import Client
 
-import db
 from config import from_env
 from data_stream import MarketDataStream
 from strategy import evaluate_signal
@@ -444,7 +443,6 @@ def _format_trade_event_message(symbol: str, title: str, detail: str) -> str:
 def main() -> None:
     """Bootstrap services and run the bot heartbeat loop."""
     settings = from_env()
-    db.init_db()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1095,12 +1093,6 @@ def main() -> None:
         )
         filled_qty = executor.round_qty(filled_qty)
 
-        try:
-            _db_trade_id = db.record_entry(symbol, side, entry_price, filled_qty, tp, sl_common)
-        except Exception as _db_exc:
-            logger.warning("db.record_entry failed: %s", _db_exc)
-            _db_trade_id = None
-
         trade_state = {
             "entry_price": entry_price,
             "qty": filled_qty,
@@ -1113,7 +1105,6 @@ def main() -> None:
             "anchor_risk_distance": risk_distance,
             # TP should not be inflated by the widened emergency SL.
             "tp_risk_cap": tp_risk_cap,
-            "db_trade_id": _db_trade_id,
         }
 
 
@@ -1356,13 +1347,6 @@ def main() -> None:
                 trade_state["risk_distance"] = new_risk
                 # Keep existing break-even logic; do not force break-even movement after repurchase.
 
-                _tid = trade_state.get("db_trade_id")
-                if _tid is not None:
-                    try:
-                        db.record_scale(_tid, new_entry, new_qty, new_tp)
-                    except Exception as _db_exc:
-                        trades_logger.info("db.record_scale failed: %s", _db_exc)
-
                 return {
                     "entry_price": new_entry,
                     "qty": new_qty,
@@ -1515,12 +1499,6 @@ def main() -> None:
                     pnl = -pnl
                 risk.update_trade(pnl, datetime.now(timezone.utc))
                 trades_logger.info("exit %s result=%s pnl=%.4f", symbol, result, pnl)
-                _tid = trade_state.get("db_trade_id")
-                if _tid is not None:
-                    try:
-                        db.record_exit(_tid, exit_price, result, pnl)
-                    except Exception as _db_exc:
-                        trades_logger.info("db.record_exit failed: %s", _db_exc)
                 return
             trades_logger.info("exit %s result=%s pnl=0.0", symbol, result)
             return
