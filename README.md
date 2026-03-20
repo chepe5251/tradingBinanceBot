@@ -1,7 +1,7 @@
 # Binance Futures Scalping Bot
 
 > Algorithmic trading bot for **Binance USDT-M Perpetual Futures**.
-> Scans 529+ pairs in real time, detects high-probability **Liquidity Sweep Reversals** on M15, and executes one position at a time with automatic TP/SL protection, trailing stop, and loss-based scaling.
+> Scans 529+ pairs in real time, detects high-probability **Order Block + Break of Structure** setups on M15, and executes one position at a time with automatic TP/SL protection, trailing stop, and loss-based scaling.
 
 ---
 
@@ -49,69 +49,79 @@
 
 ## Strategy
 
-### Liquidity Sweep Reversal (M15)
+### Order Block + Break of Structure (OB+BOS) — M15
 
-The bot targets **stop-hunt reversals**: candles that briefly break a key 20-bar high or low but close back inside the prior range, signalling that the breakout was absorbed by institutional orders. A second closed candle is required to confirm the move before any signal is emitted.
+The bot detects **institutional order blocks** by finding a Break of Structure (BOS) — a strong directional candle that breaks a key 20-bar level — then waits for price to **return to the origin zone** of that move. Entry is anticipatory: the bot enters at the institutional zone, not after the move has already happened.
 
-#### LONG Setup — all 7 conditions must pass in order
+---
 
-| # | Filter | Condition |
-|---|--------|-----------|
-| 1 | **Trend bullish** | `close > EMA200` AND `EMA50 > EMA200` |
-| 2 | **Bearish sweep** | Sweep candle `low < lowest_low_20` |
-| 3 | **False breakout** | Sweep candle `close > lowest_low_20` |
-| 4 | **Absorption wick** | `lower_wick / range ≥ 0.6` |
-| 5 | **Volume spike** | Sweep candle `volume ≥ 1.3 × avg_vol_20` |
-| 6 | **Size filter** | Sweep candle `range < 2 × ATR` |
-| 7 | **Reversal confirm** | Next candle `high > sweep_high` AND `close > sweep_close` |
+#### Concept
+
+```
+       BOS impulse candle
+       ┌──────────────────►  price breaks structure high
+       │
+[OB candle] ◄── last bearish candle before the BOS
+       │         this zone is where institutional buys were placed
+       │
+       └──────────────────►  price returns to OB zone → ENTRY
+```
+
+---
+
+#### LONG Setup — all conditions must pass in order
+
+| # | Condition | Detail |
+|---|-----------|--------|
+| 1 | **Strong uptrend** | `close > EMA200` AND `EMA50 > EMA200` |
+| 2 | **BOS detected** | A candle broke above `highest_high_20` with `body ≥ 60%` of range and `volume ≥ 1.5× avg` |
+| 3 | **Order Block identified** | Last bearish candle immediately before the BOS impulse candle |
+| 4 | **Price returned to OB** | Current candle `low` is inside OB zone (`ob_low ≤ low ≤ ob_high`) |
+| 5 | **OB not violated** | No candle between BOS and now closed below `ob_low` |
+| 6 | **Rejection wick** | `lower_wick / range ≥ 0.40` — absorption at the zone |
+| 7 | **Volume confirmation** | Current candle `volume ≥ 1.2× avg_vol_20` |
+| 8 | **OB not expired** | BOS occurred within last `MAX_OB_AGE = 10` candles |
 
 #### SHORT Setup
 
-Exact mirror of the LONG setup:
+Exact mirror:
 - `close < EMA200` AND `EMA50 < EMA200`
-- Sweep candle `high > highest_high_20`, closes back below
-- `upper_wick / range ≥ 0.6`
-- Confirmation candle `low < sweep_low` AND `close < sweep_close`
+- BOS: strong bearish candle breaks `lowest_low_20`
+- Order Block: last bullish candle before the BOS
+- Price returns to OB: current `high` inside OB zone
+- OB not violated: no close **above** `ob_high` since BOS
+- `upper_wick / range ≥ 0.40`
 
 #### Levels
 
 ```
-Entry  = close of confirmation candle
-SL     = low/high of sweep candle
-TP     = entry ± (risk × 2.0)
+Entry      = close of the rejection candle (current bar)
+SL (LONG)  = ob_low − 0.1 × ATR
+SL (SHORT) = ob_high + 0.1 × ATR
+TP         = entry ± (risk × 2.5)   ← RR 2.5:1
 ```
 
-#### Validation Layers (applied after signal detection)
-
-Every signal from `evaluate_signal()` must pass 5 additional hard filters before it is considered valid. All 5 must pass — any failure discards the signal silently (logged to `trades.log` with the reject reason).
-
-| Layer | Filter | Condition |
-|-------|--------|-----------|
-| 1 | **HTF context aligned** | 1H `close > EMA200` AND EMA slope ≥ threshold (LONG) |
-| 2 | **Clean structure** | `estructura_valida` AND `retroceso_valido` both true |
-| 3 | **No overextension / FOMO** | Price within `1.8 × ATR` of fast EMA AND candle body `≤ 2 × ATR` |
-| 4 | **M15 momentum** | Volume confirmed + RSI in range + MACD M15 aligned |
-| 5 | **1H MACD aligned** | MACD line > Signal line AND histogram > 0 on 1H (LONG) |
-
-Reject codes logged in `trades.log`:
-
-| Code | Meaning |
-|------|---------|
-| `contexto_htf_desalineado` | 1H trend direction against the trade |
-| `estructura_no_valida` | Pullback structure not clean |
-| `sobreextension_o_fomo` | Price too far from EMA or candle too large |
-| `momentum_insuficiente` | RSI out of range or MACD M15 not aligned |
-| `macd_htf_desalineado` | MACD 1H against the trade direction |
-
-#### Signal Score
-
-Signals are ranked by score when multiple setups appear simultaneously. Only the top-scoring signal is executed.
+#### Signal Score (max ~6.0)
 
 | Component | Formula | Max |
 |-----------|---------|-----|
-| Wick quality | `(wick_ratio − 0.6) / 0.4 × 3` | 3.0 |
-| Volume boost | `vol / avg_vol − 1.3` | 2.0 |
-| **Total** | | **5.0** |
+| Wick quality | `(wick_ratio − 0.40) / 0.60 × 3` | 3.0 |
+| Volume strength | `vol / avg_vol − 1.2` | 2.0 |
+| OB freshness | `(10 − ob_age) / 10` — newer BOS scores higher | 1.0 |
+
+---
+
+### Key Constants
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `BOS_LOOKBACK` | 20 | Bars used to define the prior structure high/low |
+| `BOS_BODY_RATIO` | 0.60 | Min body-to-range ratio for a valid BOS candle |
+| `BOS_VOL_MULT` | 1.5 | Min volume multiplier for BOS candle |
+| `OB_WICK_RATIO` | 0.40 | Min rejection wick at the Order Block |
+| `OB_VOL_MULT` | 1.2 | Min volume at the rejection candle |
+| `MAX_OB_AGE` | 10 | Max candles since BOS before the OB expires |
+| `RR_TARGET` | 2.5 | Risk:Reward ratio |
 
 ---
 
@@ -373,7 +383,7 @@ tail -f logs/trades.log
 
 ```
 main.py          Application entry point and orchestration loop (1 300+ lines)
-strategy.py      Liquidity Sweep Reversal signal engine (210 lines)
+strategy.py      Order Block + Break of Structure signal engine
 execution.py     Order routing, rounding, OCO monitor, trailing stop (725 lines)
 data_stream.py   WebSocket kline multiplexer with auto-restart (350 lines)
 risk.py          RiskManager: cooldown, loss pause, drawdown guard (124 lines)

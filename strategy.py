@@ -1,17 +1,14 @@
-"""Liquidity Sweep Reversal signal engine for M15 futures trading.
+"""Order Block + Break of Structure (OB+BOS) signal engine for M15 futures.
 
-Detects candles that sweep a key liquidity level (breaking a 20-bar high/low)
-but close back inside the prior range, signalling absorption and a likely
-reversal.  Confirmation is required from the next closed candle before any
-signal is emitted.
+Detects institutional order blocks by identifying a Break of Structure (BOS)
+followed by a price return to the origin zone. Entry is anticipatory —
+the bot enters when price returns to the institutional zone, not after
+the move has already happened.
 
-Score breakdown (max ~7.0):
-  3.0  — wick quality   (wick_ratio vs MIN_WICK_RATIO)
-  2.0  — sweep volume   (s_vol / avg_vol vs VOL_MULT)
-  1.5  — 1H perfect alignment (ema50 > ema200 AND close > ema50)
-  0.5  — 1H partial alignment (close > ema200 only)
-  0.5  — confirm candle volume (>= 1.1x avg_vol)
- -1.0  — 1H misaligned (HTF trend against the signal)
+Score breakdown (max ~6.0):
+  3.0  — wick quality      (wick_ratio vs OB_WICK_RATIO baseline)
+  2.0  — volume strength   (current_vol / avg_vol vs OB_VOL_MULT)
+  1.0  — OB freshness      (newer BOS = higher score; decays linearly)
 """
 from __future__ import annotations
 
@@ -19,27 +16,25 @@ from typing import Optional
 
 import pandas as pd
 
-EMA_TREND_FAST = 50
-EMA_TREND_SLOW = 200
-SWEEP_LOOKBACK = 20
-VOL_LOOKBACK = 20
-MIN_WICK_RATIO = 0.45   # lowered: accepts less perfect wicks
-VOL_MULT = 1.0          # lowered: accepts average-volume sweeps
-MAX_RANGE_ATR = 3.0     # raised: accepts larger sweep candles
-MIN_RISK_ATR = 0.3      # lowered: accepts tighter setups
-RR_TARGET = 2.0
+EMA_FAST = 50
+EMA_SLOW = 200
+BOS_LOOKBACK = 20          # bars to look back for structure high/low
+BOS_BODY_RATIO = 0.60      # minimum body ratio for BOS candle
+BOS_VOL_MULT = 1.5         # minimum volume multiplier for BOS candle
+OB_WICK_RATIO = 0.40       # minimum wick ratio for OB rejection candle
+OB_VOL_MULT = 1.2          # minimum volume for OB rejection candle
+VOL_LOOKBACK = 20          # bars for average volume calculation
+RR_TARGET = 2.5            # risk:reward target
+MIN_RISK_ATR = 0.3         # minimum risk in ATR units
+MAX_OB_AGE = 10            # maximum candles since BOS before OB expires
 
 
 def _ema(series: pd.Series, period: int) -> pd.Series:
-    """Exponential moving average."""
     return series.ewm(span=period, adjust=False).mean()
 
 
 def _atr(df: pd.DataFrame, period: int) -> pd.Series:
-    """ATR using EWMA of true range."""
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
+    high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
     tr = pd.concat(
         [
@@ -68,215 +63,225 @@ def evaluate_signal(
     rsi_short_max: float,
     volume_min_ratio: float,
 ) -> Optional[dict]:
-    """Evaluate one symbol for a Liquidity Sweep Reversal entry.
+    """Evaluate one symbol for an Order Block + BOS entry.
 
     Requires at least 230 M15 candles so EMA200 is meaningful.
-    context_df (1H) is used to compute a 4-state HTF bias that adds a
-    bonus or penalty to the final score — signals are never hard-blocked
-    by the 1H, but the score discriminates quality.
+    context_df is accepted for API compatibility but not used by this strategy.
     """
     del (
         ema_trend, ema_fast, ema_mid, atr_avg_window, volume_avg_window,
         rsi_period, rsi_long_min, rsi_long_max, rsi_short_min, rsi_short_max,
-        volume_min_ratio,
+        volume_min_ratio, context_df,
     )
 
     if main_df.empty or len(main_df) < 230:
         return None
 
-    # ── 1H bias (CAMBIO 1) ────────────────────────────────────────────────────
-    htf_bias: Optional[str] = None
-    htf_score_bonus: float = 0.0
+    df = main_df.copy()
+    df["ema50"] = _ema(df["close"], EMA_FAST)
+    df["ema200"] = _ema(df["close"], EMA_SLOW)
+    df["atr"] = _atr(df, atr_period)
+    df["avg_vol"] = df["volume"].rolling(VOL_LOOKBACK).mean()
+    df["body"] = (df["close"] - df["open"]).abs()
+    df["range"] = df["high"] - df["low"]
+    df["body_ratio"] = df["body"] / df["range"].replace(0, float("nan"))
+    # Shifted so the BOS candle itself is not included in its own lookback
+    df["highest_high_bos"] = df["high"].rolling(BOS_LOOKBACK).max().shift(1)
+    df["lowest_low_bos"] = df["low"].rolling(BOS_LOOKBACK).min().shift(1)
 
-    if context_df is not None and not context_df.empty and len(context_df) >= 200:
-        h1 = context_df.copy()
-        h1["ema50"] = _ema(h1["close"], 50)
-        h1["ema200"] = _ema(h1["close"], 200)
-        last_h1 = h1.iloc[-1]
-        h1_close = float(last_h1["close"])
-        h1_ema50 = float(last_h1["ema50"])
-        h1_ema200 = float(last_h1["ema200"])
-
-        if not any(pd.isna(v) for v in [h1_ema50, h1_ema200, h1_close]):
-            if h1_ema50 > h1_ema200 and h1_close > h1_ema50:
-                htf_bias = "LONG"
-                htf_score_bonus = 1.5    # perfect alignment
-            elif h1_close > h1_ema200:
-                htf_bias = "LONG_WEAK"
-                htf_score_bonus = 0.5    # partial alignment
-            elif h1_ema50 < h1_ema200 and h1_close < h1_ema50:
-                htf_bias = "SHORT"
-                htf_score_bonus = 1.5
-            elif h1_close < h1_ema200:
-                htf_bias = "SHORT_WEAK"
-                htf_score_bonus = 0.5
-
-    # ── M15 indicators ────────────────────────────────────────────────────────
-    m15 = main_df.copy()
-    m15["ema50"] = _ema(m15["close"], EMA_TREND_FAST)
-    m15["ema200"] = _ema(m15["close"], EMA_TREND_SLOW)
-    m15["atr"] = _atr(m15, atr_period)
-    m15["avg_vol20"] = m15["volume"].rolling(VOL_LOOKBACK).mean()
-    # Reference levels shifted so the sweep candle itself is excluded.
-    m15["highest_high_20"] = m15["high"].rolling(SWEEP_LOOKBACK).max().shift(1)
-    m15["lowest_low_20"] = m15["low"].rolling(SWEEP_LOOKBACK).min().shift(1)
-
-    sweep = m15.iloc[-2]    # candle that swept the level
-    confirm = m15.iloc[-1]  # candle that confirms the reversal (just closed)
-
+    current = df.iloc[-1]
     required = [
-        sweep["ema50"], sweep["ema200"], sweep["atr"],
-        sweep["avg_vol20"], sweep["highest_high_20"], sweep["lowest_low_20"],
-        sweep["high"], sweep["low"], sweep["open"], sweep["close"], sweep["volume"],
-        confirm["high"], confirm["low"], confirm["close"],
+        current["ema50"], current["ema200"], current["atr"], current["avg_vol"],
+        current["high"], current["low"], current["open"], current["close"],
+        current["volume"],
     ]
     if any(pd.isna(v) for v in required):
         return None
 
-    ema50 = float(sweep["ema50"])
-    ema200 = float(sweep["ema200"])
-    atr_val = float(sweep["atr"])
-    avg_vol = float(sweep["avg_vol20"])
-    highest_20 = float(sweep["highest_high_20"])
-    lowest_20 = float(sweep["lowest_low_20"])
+    ema50_cur = float(current["ema50"])
+    ema200_cur = float(current["ema200"])
+    atr_val = float(current["atr"])
+    avg_vol_cur = float(current["avg_vol"])
 
-    s_high = float(sweep["high"])
-    s_low = float(sweep["low"])
-    s_open = float(sweep["open"])
-    s_close = float(sweep["close"])
-    s_vol = float(sweep["volume"])
-
-    c_high = float(confirm["high"])
-    c_low = float(confirm["low"])
-    c_close = float(confirm["close"])
-    confirm_vol = float(confirm.get("volume", 0))
-
-    if atr_val <= 0 or avg_vol <= 0:
+    if atr_val <= 0 or avg_vol_cur <= 0:
         return None
 
-    sweep_range = s_high - s_low
-    if sweep_range <= 0:
+    cur_close = float(current["close"])
+    cur_low = float(current["low"])
+    cur_high = float(current["high"])
+    cur_open = float(current["open"])
+    cur_vol = float(current["volume"])
+    cur_range = cur_high - cur_low
+
+    if cur_range <= 0:
         return None
 
-    entry_price = c_close
-
-    ts = confirm.get("close_time")
+    ts = current.get("close_time")
     timestamp = (
         ts.strftime("%Y-%m-%d %H:%M:%S UTC")
         if isinstance(ts, pd.Timestamp)
         else str(ts)
     )
 
-    # ── LONG ──────────────────────────────────────────────────────────────────
-    if s_close > ema200:                                   # 1. price above EMA200
-        if s_low < lowest_20:                              # 2. bearish sweep
-            if s_close > lowest_20:                        # 3. false breakout
-                lower_wick = min(s_open, s_close) - s_low
-                wick_ratio = lower_wick / sweep_range
-                if wick_ratio >= MIN_WICK_RATIO:           # 4. absorption
-                    if s_vol >= VOL_MULT * avg_vol:        # 5. volume
-                        if sweep_range < MAX_RANGE_ATR * atr_val:   # 6. size
-                            if c_close > s_close:          # 7. confirm close
-                                stop_price = s_low
-                                risk = entry_price - stop_price
+    n = len(df)
+    # Scan bars before the current one; allow enough history for BOS lookback
+    scan_end = n - 1      # exclusive: current bar is the rejection candle
+    scan_start = max(0, scan_end - (MAX_OB_AGE + 5))
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _find_bos_long():
+        """Return (bos_idx, ob_candle) for the most recent valid LONG BOS."""
+        for i in range(scan_end - 1, scan_start - 1, -1):
+            bar = df.iloc[i]
+            needed = ["highest_high_bos", "avg_vol", "body_ratio",
+                      "high", "low", "open", "close", "volume"]
+            if any(pd.isna(bar[c]) for c in needed):
+                continue
+            if float(bar["range"]) <= 0:
+                continue
+            # BOS: strong bullish candle breaks above prior structure high
+            if not (
+                float(bar["high"]) > float(bar["highest_high_bos"])
+                and float(bar["body_ratio"]) >= BOS_BODY_RATIO
+                and float(bar["volume"]) >= BOS_VOL_MULT * float(bar["avg_vol"])
+                and float(bar["close"]) > float(bar["open"])
+            ):
+                continue
+            # Order Block: last bearish candle immediately before the BOS candle
+            for j in range(i - 1, max(0, i - 10), -1):
+                ob = df.iloc[j]
+                if float(ob["close"]) < float(ob["open"]):
+                    return i, ob
+        return None
+
+    def _find_bos_short():
+        """Return (bos_idx, ob_candle) for the most recent valid SHORT BOS."""
+        for i in range(scan_end - 1, scan_start - 1, -1):
+            bar = df.iloc[i]
+            needed = ["lowest_low_bos", "avg_vol", "body_ratio",
+                      "high", "low", "open", "close", "volume"]
+            if any(pd.isna(bar[c]) for c in needed):
+                continue
+            if float(bar["range"]) <= 0:
+                continue
+            # BOS: strong bearish candle breaks below prior structure low
+            if not (
+                float(bar["low"]) < float(bar["lowest_low_bos"])
+                and float(bar["body_ratio"]) >= BOS_BODY_RATIO
+                and float(bar["volume"]) >= BOS_VOL_MULT * float(bar["avg_vol"])
+                and float(bar["close"]) < float(bar["open"])
+            ):
+                continue
+            # Order Block: last bullish candle immediately before the BOS candle
+            for j in range(i - 1, max(0, i - 10), -1):
+                ob = df.iloc[j]
+                if float(ob["close"]) > float(ob["open"]):
+                    return i, ob
+        return None
+
+    def _score(wick_ratio: float, vol_ratio: float, ob_age: int) -> float:
+        wick_score = min(3.0, (wick_ratio - OB_WICK_RATIO) / (1 - OB_WICK_RATIO) * 3)
+        vol_score = min(2.0, vol_ratio - OB_VOL_MULT)
+        freshness_score = min(1.0, (MAX_OB_AGE - ob_age) / MAX_OB_AGE)
+        return round(wick_score + vol_score + freshness_score, 2)
+
+    # ── LONG ─────────────────────────────────────────────────────────────────
+    if cur_close > ema200_cur and ema50_cur > ema200_cur:
+        result = _find_bos_long()
+        if result is not None:
+            bos_idx, ob_candle = result
+            ob_age = (n - 1) - bos_idx
+            if ob_age <= MAX_OB_AGE:
+                ob_high = float(ob_candle["high"])
+                ob_low = float(ob_candle["low"])
+                # OB integrity: no close below ob_low between BOS and current bar
+                ob_intact = all(
+                    float(df.iloc[k]["close"]) >= ob_low
+                    for k in range(bos_idx + 1, n - 1)
+                )
+                if ob_intact and ob_low <= cur_low <= ob_high:
+                    if cur_close > ob_low:                      # not violated on close
+                        lower_wick = min(cur_open, cur_close) - cur_low
+                        wick_ratio = lower_wick / cur_range
+                        if wick_ratio >= OB_WICK_RATIO:
+                            if cur_vol >= OB_VOL_MULT * avg_vol_cur:
+                                stop_price = ob_low - (0.1 * atr_val)
+                                risk = cur_close - stop_price
                                 if risk >= MIN_RISK_ATR * atr_val and risk > 0:
-                                    tp_price = entry_price + risk * RR_TARGET
-
-                                    # CAMBIO 2 — HTF bonus/penalty
-                                    htf_aligned = htf_bias in ("LONG", "LONG_WEAK")
-                                    htf_penalty = -1.0 if htf_bias in ("SHORT", "SHORT_WEAK") else 0.0
-                                    htf_bonus = htf_score_bonus if htf_aligned else htf_penalty
-
-                                    score = round(
-                                        min(3.0, (wick_ratio - MIN_WICK_RATIO) / (1 - MIN_WICK_RATIO) * 3)
-                                        + min(2.0, (s_vol / avg_vol - VOL_MULT))
-                                        + htf_bonus,
-                                        2,
-                                    )
-
-                                    # CAMBIO 5 — confirm candle volume bonus
-                                    vol_confirm_bonus = 0.5 if confirm_vol >= 1.1 * avg_vol else 0.0
-                                    score += vol_confirm_bonus
-                                    score = round(score, 2)
-
+                                    tp_price = cur_close + risk * RR_TARGET
                                     return {
                                         "side": "BUY",
-                                        "price": entry_price,
+                                        "price": cur_close,
                                         "stop_price": stop_price,
                                         "tp_price": tp_price,
                                         "risk_per_unit": risk,
                                         "rr_target": RR_TARGET,
                                         "atr": atr_val,
-                                        "score": score,
-                                        "strategy": "liquidity_sweep_reversal",
-                                        "htf_bias": htf_bias or "NONE",      # CAMBIO 3
-                                        "htf_score_bonus": htf_score_bonus,  # CAMBIO 3
+                                        "score": _score(wick_ratio, cur_vol / avg_vol_cur, ob_age),
+                                        "strategy": "ob_bos",
+                                        "htf_bias": "LONG",
+                                        "htf_score_bonus": 0.0,
                                         "estructura_valida": True,
                                         "retroceso_valido": True,
                                         "volumen_confirmado": True,
                                         "volume_ok": True,
                                         "confirm_m15": (
-                                            f"Sweep below {lowest_20:.4f} | "
+                                            f"OB zone {ob_low:.4f}-{ob_high:.4f} | "
+                                            f"BOS age={ob_age} candles | "
                                             f"wick={wick_ratio:.2f} | "
-                                            f"vol={s_vol/avg_vol:.1f}x | "
-                                            f"confirm close={c_close:.4f}"
+                                            f"vol={cur_vol/avg_vol_cur:.1f}x | "
+                                            f"close={cur_close:.4f}"
                                         ),
                                         "breakout_time": timestamp,
                                     }
 
     # ── SHORT ─────────────────────────────────────────────────────────────────
-    if s_close < ema200:                                   # 1. price below EMA200
-        if s_high > highest_20:                            # 2. bullish sweep
-            if s_close < highest_20:                       # 3. false breakout
-                upper_wick = s_high - max(s_open, s_close)
-                wick_ratio = upper_wick / sweep_range
-                if wick_ratio >= MIN_WICK_RATIO:           # 4. absorption
-                    if s_vol >= VOL_MULT * avg_vol:        # 5. volume
-                        if sweep_range < MAX_RANGE_ATR * atr_val:   # 6. size
-                            if c_close < s_close:          # 7. confirm close
-                                stop_price = s_high
-                                risk = stop_price - entry_price
+    if cur_close < ema200_cur and ema50_cur < ema200_cur:
+        result = _find_bos_short()
+        if result is not None:
+            bos_idx, ob_candle = result
+            ob_age = (n - 1) - bos_idx
+            if ob_age <= MAX_OB_AGE:
+                ob_high = float(ob_candle["high"])
+                ob_low = float(ob_candle["low"])
+                # OB integrity: no close above ob_high between BOS and current bar
+                ob_intact = all(
+                    float(df.iloc[k]["close"]) <= ob_high
+                    for k in range(bos_idx + 1, n - 1)
+                )
+                if ob_intact and ob_low <= cur_high <= ob_high:
+                    if cur_close < ob_high:                     # not violated on close
+                        upper_wick = cur_high - max(cur_open, cur_close)
+                        wick_ratio = upper_wick / cur_range
+                        if wick_ratio >= OB_WICK_RATIO:
+                            if cur_vol >= OB_VOL_MULT * avg_vol_cur:
+                                stop_price = ob_high + (0.1 * atr_val)
+                                risk = stop_price - cur_close
                                 if risk >= MIN_RISK_ATR * atr_val and risk > 0:
-                                    tp_price = entry_price - risk * RR_TARGET
-
-                                    # CAMBIO 2 — HTF bonus/penalty
-                                    htf_aligned = htf_bias in ("SHORT", "SHORT_WEAK")
-                                    htf_penalty = -1.0 if htf_bias in ("LONG", "LONG_WEAK") else 0.0
-                                    htf_bonus = htf_score_bonus if htf_aligned else htf_penalty
-
-                                    score = round(
-                                        min(3.0, (wick_ratio - MIN_WICK_RATIO) / (1 - MIN_WICK_RATIO) * 3)
-                                        + min(2.0, (s_vol / avg_vol - VOL_MULT))
-                                        + htf_bonus,
-                                        2,
-                                    )
-
-                                    # CAMBIO 5 — confirm candle volume bonus
-                                    vol_confirm_bonus = 0.5 if confirm_vol >= 1.1 * avg_vol else 0.0
-                                    score += vol_confirm_bonus
-                                    score = round(score, 2)
-
+                                    tp_price = cur_close - risk * RR_TARGET
                                     return {
                                         "side": "SELL",
-                                        "price": entry_price,
+                                        "price": cur_close,
                                         "stop_price": stop_price,
                                         "tp_price": tp_price,
                                         "risk_per_unit": risk,
                                         "rr_target": RR_TARGET,
                                         "atr": atr_val,
-                                        "score": score,
-                                        "strategy": "liquidity_sweep_reversal",
-                                        "htf_bias": htf_bias or "NONE",      # CAMBIO 3
-                                        "htf_score_bonus": htf_score_bonus,  # CAMBIO 3
+                                        "score": _score(wick_ratio, cur_vol / avg_vol_cur, ob_age),
+                                        "strategy": "ob_bos",
+                                        "htf_bias": "SHORT",
+                                        "htf_score_bonus": 0.0,
                                         "estructura_valida": True,
                                         "retroceso_valido": True,
                                         "volumen_confirmado": True,
                                         "volume_ok": True,
                                         "confirm_m15": (
-                                            f"Sweep above {highest_20:.4f} | "
+                                            f"OB zone {ob_low:.4f}-{ob_high:.4f} | "
+                                            f"BOS age={ob_age} candles | "
                                             f"wick={wick_ratio:.2f} | "
-                                            f"vol={s_vol/avg_vol:.1f}x | "
-                                            f"confirm close={c_close:.4f}"
+                                            f"vol={cur_vol/avg_vol_cur:.1f}x | "
+                                            f"close={cur_close:.4f}"
                                         ),
                                         "breakout_time": timestamp,
                                     }
