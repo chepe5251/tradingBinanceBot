@@ -88,7 +88,7 @@ class MarketDataStream:
                     continue
                 self._candles[interval] = {s: deque(maxlen=limit) for s in self.symbols}
 
-        self._on_main_close: Optional[Callable[[str], None]] = None
+        self._on_close_callbacks: Dict[str, Optional[Callable[[str], None]]] = {}
         self._last_closed_ts: Optional[int] = None
         self._last_closed_wall: Optional[float] = None
         self._event_count: int = 0
@@ -226,15 +226,25 @@ class MarketDataStream:
             self._last_closed_ts = int(time.time() * 1000)
             self._last_closed_wall = time.time()
 
-            if self._on_main_close and self.symbols:
-                try:
-                    self._on_main_close(self.symbols[0])
-                except Exception as exc:
-                    logger.error("on_main_close raised: %s", exc)
+            now_wall = time.time()
+            for iv, callback in list(self._on_close_callbacks.items()):
+                if callback is None:
+                    continue
+                period = self._INTERVAL_SECONDS.get(iv, 0)
+                if period <= 0:
+                    continue
+                # Fire callback only when this interval's boundary just passed.
+                # The scheduler wakes ~2 s after M15 close; refresh takes ~17 s,
+                # so elapsed ≤ 30 s reliably covers all newly-closed intervals.
+                if now_wall % period <= 30.0 and self.symbols:
+                    try:
+                        callback(self.symbols[0])
+                    except Exception as exc:
+                        logger.error("on_close[%s] raised: %s", iv, exc)
 
-    def start_scheduler(self, on_main_close: Callable[[str], None]) -> None:
-        """Start the REST-based scheduler and register the close callback."""
-        self._on_main_close = on_main_close
+    def start_scheduler(self, on_close_callbacks: Dict[str, Callable[[str], None]]) -> None:
+        """Start the REST-based scheduler and register per-interval close callbacks."""
+        self._on_close_callbacks = dict(on_close_callbacks)
         self._stop_event.clear()
         self._scheduler_thread = threading.Thread(
             target=self._scheduler_loop,
