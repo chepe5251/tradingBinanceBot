@@ -26,12 +26,12 @@ from strategy import evaluate_signal  # noqa: E402
 
 # ── configuration ─────────────────────────────────────────────────────────────
 BACKTEST_DAYS = 30
-TOP_SYMBOLS = 999
+TOP_SYMBOLS = 150
 INTERVALS = ["15m", "1h", "4h"]
 CANDLES_PER_INTERVAL: dict[str, int] = {"15m": 1500, "1h": 720, "4h": 500}
 INITIAL_CAPITAL = 500.0
 MARGIN_PER_TRADE = 5.0
-LEVERAGE = 10
+LEVERAGE = 20
 COMMISSION_PCT = 0.0004   # 0.04 % per side (taker)
 ATR_PERIOD = 14
 
@@ -53,7 +53,7 @@ _EVAL_KWARGS: dict = dict(
 
 MAX_CANDLES_HOLD = 50   # close at market after this many candles
 SKIP_AFTER_SIGNAL = 10  # skip candles after a signal to avoid overlap
-MAX_WORKERS = 10        # parallel download threads
+MAX_WORKERS = 20        # parallel download threads
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
