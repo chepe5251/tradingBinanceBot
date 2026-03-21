@@ -177,7 +177,18 @@ class FuturesExecutor:
             self.client.futures_change_margin_type(symbol=self.symbol, marginType=self.margin_type)
         except Exception:
             pass
-        self.client.futures_change_leverage(symbol=self.symbol, leverage=self.leverage)
+        lev = self.leverage
+        while lev >= 1:
+            try:
+                self.client.futures_change_leverage(symbol=self.symbol, leverage=lev)
+                self.leverage = lev
+                break
+            except Exception as exc:
+                msg = str(exc)
+                if "-4028" in msg and lev > 1:
+                    lev = max(1, lev - 5)
+                else:
+                    raise
 
     def has_open_position(self) -> bool:
         """Return whether this symbol currently has any non-zero position."""

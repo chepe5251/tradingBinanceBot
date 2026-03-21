@@ -12,7 +12,9 @@ from __future__ import annotations
 import csv
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pandas as pd
@@ -51,6 +53,7 @@ _EVAL_KWARGS: dict = dict(
 
 MAX_CANDLES_HOLD = 50   # close at market after this many candles
 SKIP_AFTER_SIGNAL = 10  # skip candles after a signal to avoid overlap
+MAX_WORKERS = 10        # parallel download threads
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -573,6 +576,34 @@ def _print_report(
     print()
 
 
+# ── parallel worker ───────────────────────────────────────────────────────────
+
+_thread_local = threading.local()
+
+
+def _get_client(api_key: str, api_secret: str) -> Client:
+    """Return a per-thread Binance client (created once per thread)."""
+    if not hasattr(_thread_local, "client"):
+        _thread_local.client = Client(api_key, api_secret)
+    return _thread_local.client
+
+
+def _process_task(
+    api_key: str, api_secret: str, sym: str, interval: str
+) -> tuple[str, str, list[dict], int, int, str | None]:
+    """Fetch klines and simulate trades for one (symbol, interval) pair."""
+    client = _get_client(api_key, api_secret)
+    limit = CANDLES_PER_INTERVAL[interval]
+    try:
+        df = _fetch_klines(client, sym, interval, limit)
+    except Exception as exc:
+        return sym, interval, [], 0, 0, f"error: {exc}"
+    if len(df) < 232:
+        return sym, interval, [], 0, 0, f"datos insuficientes ({len(df)} velas)"
+    trades, s4h, ssc = _simulate_trades(df, sym, interval)
+    return sym, interval, trades, s4h, ssc, None
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -592,31 +623,24 @@ def main() -> None:
     all_trades: list[dict] = []
     total_skipped_4h_sell  = 0
     total_skipped_low_score = 0
-    total_tasks = len(symbols) * len(INTERVALS)
+    tasks = [(api_key, api_secret, sym, interval)
+             for sym in symbols for interval in INTERVALS]
+    total_tasks = len(tasks)
     task_num = 0
 
-    for sym in symbols:
-        time.sleep(0.1)  # pausa entre símbolos para no saturar la API
-        for interval in INTERVALS:
+    print(f"Iniciando con {MAX_WORKERS} workers paralelos...")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_process_task, *t): t for t in tasks}
+        for future in as_completed(futures):
             task_num += 1
-            limit = CANDLES_PER_INTERVAL[interval]
-            print(f"Analizando {sym} {interval}... ({task_num}/{total_tasks})")
-
-            try:
-                df = _fetch_klines(client, sym, interval, limit)
-            except Exception as exc:
-                print(f"  [SKIP] {sym} {interval}: {exc}")
-                continue
-
-            if len(df) < 232:
-                print(f"  [SKIP] {sym} {interval}: datos insuficientes ({len(df)} velas)")
-                continue
-
-            trades, s4h, ssc = _simulate_trades(df, sym, interval)
-            all_trades.extend(trades)
-            total_skipped_4h_sell  += s4h
-            total_skipped_low_score += ssc
-            print(f"  → {len(trades)} señales")
+            sym, interval, trades, s4h, ssc, skip_reason = future.result()
+            if skip_reason:
+                print(f"  [SKIP] {sym} {interval}: {skip_reason} ({task_num}/{total_tasks})")
+            else:
+                all_trades.extend(trades)
+                total_skipped_4h_sell  += s4h
+                total_skipped_low_score += ssc
+                print(f"  {sym} {interval} → {len(trades)} señales ({task_num}/{total_tasks})")
 
     csv_path      = _save_csv(all_trades)
     analysis_path = _save_analysis_csv(all_trades)
