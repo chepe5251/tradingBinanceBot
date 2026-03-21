@@ -1,8 +1,35 @@
-"""Backtest — EMA Pullback momentum strategy.
+"""Backtest — EMA Pullback Long-Only strategy (Binance USDT-M Futures).
 
-Downloads historical Binance Futures klines, runs evaluate_signal candle-by-candle
-for M15 / 1H / 4H across all USDT-M perpetual pairs, calculates metrics, and saves
-three CSV files: individual trades, aggregated analysis, and equity curve.
+Downloads historical klines from Binance Futures, runs evaluate_signal candle-by-candle
+for M15 / 1H / 4H across the top 300 USDT-M perpetual pairs by volume, simulates trades
+using the exact same filters as the live bot, and saves three CSV files:
+
+  - backtest_YYYYMMDD_HHMMSS.csv   : one row per simulated trade with full metadata
+  - analysis_YYYYMMDD_HHMMSS.csv   : aggregated stats grouped by interval, score, RSI, etc.
+  - equity_YYYYMMDD_HHMMSS.csv     : equity curve with cumulative PnL and drawdown per trade
+
+Architecture — two phases:
+  Phase 1 (I/O bound)  : ThreadPoolExecutor(60 workers) downloads all klines in parallel.
+                         A RateLimiter class enforces the Binance 2300 weight/min budget.
+  Phase 2 (CPU bound)  : ProcessPoolExecutor(cpu_count) simulates trades across all cores.
+                         DataFrames are serialized to dicts for cross-process pickling.
+
+Simulation details:
+  - Starts at candle 230 (or len/2 for short series) to ensure EMA200 is warm.
+  - Checks SL/TP/TIMEOUT candle-by-candle up to MAX_CANDLES_HOLD (50).
+  - Mirrors all production filters: 4h SELL block, score < 1.0 block.
+  - Indicators are precomputed once per DataFrame and reused by evaluate_signal
+    (strategy.py skips recalculation when columns already exist).
+
+Configuration constants (edit at top of file):
+  TOP_SYMBOLS          : number of pairs to test (top N by 24h quote volume)
+  CANDLES_PER_INTERVAL : klines to fetch per interval (controls time range and API weight)
+  MARGIN_PER_TRADE     : USDT margin per trade (default 10)
+  LEVERAGE             : leverage applied to each trade (default 20x)
+  MAX_CANDLES_HOLD     : max candles before force-closing a trade as TIMEOUT
+  SKIP_AFTER_SIGNAL    : candles to skip after a signal to avoid overlapping trades
+  MAX_DL_WORKERS       : parallel threads for Phase 1 download
+  SIM_WORKERS          : parallel processes for Phase 2 simulation (auto = cpu_count)
 
 Usage (from repo root):
     python backtest/backtest.py
