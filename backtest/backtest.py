@@ -194,7 +194,7 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
     trades: list[dict] = []
     skipped_4h_sell = 0
     skipped_low_score = 0
-    i = 230  # minimum candles needed for EMA200
+    i = min(230, max(20, len(df) // 2))  # warm-up: use half the data or 230, min 20
     n = len(df)
 
     while i < n - 1:
@@ -624,7 +624,7 @@ def _process_task(
         df = _fetch_klines(client, sym, interval, limit)
     except Exception as exc:
         return sym, interval, [], 0, 0, f"error: {exc}"
-    if len(df) < 232:
+    if len(df) < 10:
         return sym, interval, [], 0, 0, f"datos insuficientes ({len(df)} velas)"
     trades, s4h, ssc = _simulate_trades(df, sym, interval)
     return sym, interval, trades, s4h, ssc, None
