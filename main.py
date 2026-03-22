@@ -31,7 +31,7 @@ _TELEGRAM_SEND_LOCK = threading.Lock()
 _TELEGRAM_LAST_SEND_TS = 0.0
 _TELEGRAM_MIN_INTERVAL_SEC = 1.2
 
-MAX_CONCURRENT_POSITIONS = 8   # hard cap on simultaneous open positions
+MAX_CONCURRENT_POSITIONS = 1   # hard cap on simultaneous open positions
 MAX_PER_SYMBOL = 1             # max open positions per symbol (enforced via symbols_with_positions filter)
 
 _ENTRY_LOCK = threading.Lock()  # prevents two intervals from placing orders simultaneously
