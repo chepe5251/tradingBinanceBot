@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import timedelta
 
 
 @dataclass
@@ -68,10 +67,10 @@ class Settings:
     limit_offset_pct: float = 0.0001  # 0.01%
     limit_timeout_sec: int = 6
     cooldown_sec: int = 180
-    max_consecutive_losses: int = 2
+    max_consecutive_losses: int = 3
     daily_drawdown_limit: float = 0.20  # legacy pct drawdown guard
     daily_drawdown_limit_usdt: float = 6.0
-    risk_pause_after_losses_sec: int = int(timedelta(hours=1).total_seconds())
+    risk_pause_after_losses_sec: int = 86400  # pause until end of UTC day
     risk_per_trade_pct: float = 0.10
     fixed_margin_per_trade_usdt: float = 5.0
     scale_level1_margin_usdt: float = 5.0
@@ -209,6 +208,20 @@ def from_env() -> Settings:
             pass
     if settings.daily_drawdown_limit_usdt < 1.0:
         settings.daily_drawdown_limit_usdt = 1.0
+
+    max_consec = os.getenv("MAX_CONSECUTIVE_LOSSES")
+    if max_consec:
+        try:
+            settings.max_consecutive_losses = max(1, int(max_consec))
+        except ValueError:
+            pass
+
+    pause_sec = os.getenv("RISK_PAUSE_AFTER_LOSSES_SEC")
+    if pause_sec:
+        try:
+            settings.risk_pause_after_losses_sec = max(60, int(pause_sec))
+        except ValueError:
+            pass
 
     paper_balance = os.getenv("PAPER_START_BALANCE")
     if paper_balance:

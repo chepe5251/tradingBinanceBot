@@ -300,6 +300,38 @@ def _format_trade_event_message(symbol: str, title: str, detail: str) -> str:
     return f"{title}\n{symbol}\n{detail}"
 
 
+class _PositionCache:
+    """Thread-safe cache for `futures_position_information` with a sliding TTL.
+
+    Reduces API weight by returning the cached response if it is fresher than
+    `_TTL` seconds.  Call `invalidate()` after opening or closing a position to
+    force an immediate refresh on the next `get()` call.
+    """
+
+    _TTL = 2.0  # seconds
+
+    def __init__(self, client: Client) -> None:
+        self._client = client
+        self._data: list = []
+        self._ts: float = 0.0
+        self._lock = threading.Lock()
+
+    def get(self) -> list:
+        now = time.monotonic()
+        with self._lock:
+            if now - self._ts < self._TTL:
+                return self._data
+        data = self._client.futures_position_information()
+        with self._lock:
+            self._data = data
+            self._ts = time.monotonic()
+        return data
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._ts = 0.0
+
+
 def main() -> None:
     """Bootstrap services and run the bot heartbeat loop."""
     settings = from_env()
@@ -346,6 +378,7 @@ def main() -> None:
         raise RuntimeError("Missing BINANCE_API_KEY or BINANCE_API_SECRET in .env")
 
     trade_client = _configure_client(api_key or "", api_secret or "", settings.use_testnet)
+    _pos_cache = _PositionCache(trade_client)
     data_client = _configure_client("", "", settings.data_use_testnet)
 
     symbols = _load_all_usdt_perp_symbols(data_client, logger, limit=300)
@@ -612,6 +645,7 @@ def main() -> None:
                 if side == "SELL":
                     pnl = -pnl
                 risk.update_trade(pnl, datetime.now(timezone.utc))
+                _pos_cache.invalidate()
                 trades_logger.info("orphan_exit %s result=%s pnl=%.4f", symbol, result, pnl)
 
             threading.Thread(target=_orphan_monitor, daemon=True, name=f"orphan-{symbol}").start()
@@ -641,7 +675,7 @@ def main() -> None:
             can_trade_now = risk.can_trade(now)
 
             try:
-                positions_snapshot = trade_client.futures_position_information()
+                positions_snapshot = _pos_cache.get()
             except Exception as exc:
                 logger.warning("Failed to fetch positions for entry gate: %s", exc)
                 return
@@ -725,7 +759,7 @@ def main() -> None:
 
             if execution_allowed:
                 try:
-                    live_positions = trade_client.futures_position_information()
+                    live_positions = _pos_cache.get()
                     live_count = sum(
                         1 for p in live_positions
                         if abs(float(p.get("positionAmt", 0))) > 0
@@ -851,9 +885,6 @@ def main() -> None:
                 sl_swing = swing_high
                 sl_atr = entry_price + (settings.stop_atr_mult * atr_val)
                 sl_common = max(sl_swing, sl_atr)
-            # Keep a structural SL reference for TP sizing; SL may be widened later for loss-based scaling.
-            sl_tp_ref = float(sl_common)
-
             qty_by_margin = executor.calc_qty(margin_to_use, entry_price)
             if qty_by_margin <= 0:
                 trades_logger.info("skip %s reason=qty_by_margin_invalid", symbol)
@@ -861,17 +892,29 @@ def main() -> None:
             qty_l1 = executor.round_qty(qty_by_margin)
 
             # Ensure SL is beyond the 150% floating-loss threshold before forced stop.
+            # If the structural SL is already inside the liquidation zone the setup is
+            # invalid — skip rather than overriding SL to a meaningless level.
             margin_initial_ref = float(settings.fixed_margin_per_trade_usdt)
             if margin_initial_ref > 0 and qty_l1 > 0:
                 min_sl_distance_for_rebuy = (margin_initial_ref * 1.5) / qty_l1
                 if side == "BUY":
                     sl_required = entry_price - min_sl_distance_for_rebuy
                     if sl_common > sl_required:
-                        sl_common = sl_required
+                        trades_logger.info(
+                            "skip %s reason=sl_inside_liquidation_zone "
+                            "sl_common=%.4f sl_required=%.4f entry=%.4f",
+                            symbol, sl_common, sl_required, entry_price,
+                        )
+                        return
                 else:
                     sl_required = entry_price + min_sl_distance_for_rebuy
                     if sl_common < sl_required:
-                        sl_common = sl_required
+                        trades_logger.info(
+                            "skip %s reason=sl_inside_liquidation_zone "
+                            "sl_common=%.4f sl_required=%.4f entry=%.4f",
+                            symbol, sl_common, sl_required, entry_price,
+                        )
+                        return
 
             risk_distance_unit = abs(entry_price - sl_common)
             if risk_distance_unit <= 0:
@@ -955,14 +998,14 @@ def main() -> None:
                 trades_logger.info("skip %s reason=entry_l1_not_filled", symbol)
                 return
 
+            _pos_cache.invalidate()
             entry_price = avg_price
             risk_distance = abs(entry_price - sl_common)
             if risk_distance <= 0:
                 trades_logger.info("skip %s reason=post_fill_risk_invalid", symbol)
                 return
-            tp_risk_cap = abs(entry_price - sl_tp_ref)
-            if tp_risk_cap <= 0:
-                tp_risk_cap = risk_distance
+            strategy_risk = float(signal.get("risk_per_unit") or 0.0)
+            tp_risk_cap = strategy_risk if strategy_risk > 0 else risk_distance
             tp_risk_basis = min(risk_distance, tp_risk_cap)
             tp_rr_effective = max(float(settings.tp_rr), 1.8)
             tp = (
@@ -971,7 +1014,7 @@ def main() -> None:
                 else entry_price - (tp_rr_effective * tp_risk_basis)
             )
             breakeven_trigger_pct_trade = (
-                max((risk_distance / entry_price), 0.005) if entry_price > 0 else 0.005
+                max((risk_distance * 0.3) / entry_price, 0.004) if entry_price > 0 else 0.004
             )
             filled_qty = executor.round_qty(filled_qty)
 
@@ -985,7 +1028,7 @@ def main() -> None:
                 # Anchor scale triggers to the first 5 USDT block.
                 "anchor_entry_price": entry_price,
                 "anchor_risk_distance": risk_distance,
-                # TP should not be inflated by the widened emergency SL.
+                # TP capped to strategy's intended risk, not the widened SL.
                 "tp_risk_cap": tp_risk_cap,
             }
 
@@ -1275,15 +1318,16 @@ def main() -> None:
                     time.sleep(2 if emergency else 1)
 
                 trades_logger.info(
-                    "entry %s side=%s exec=%s price=%.4f qty=%.6f atr=%.6f tp=%.4f sl=%.4f",
-                    symbol,
-                    side,
-                    exec_type,
-                    float(trade_state["entry_price"]),
-                    float(trade_state["qty"]),
-                    atr_val,
-                    float(trade_state["tp"]),
-                    float(trade_state["sl"]),
+                    "ENTRY %s tf=%s side=%s entry=%.4f sl_strategy=%.4f sl_swing=%.4f "
+                    "sl_atr=%.4f sl_final=%.4f tp=%.4f risk=%.4f rr_real=%.3f "
+                    "atr=%.4f score=%.2f exec=%s qty=%.6f margin=%.2f",
+                    symbol, interval, side, float(trade_state["entry_price"]),
+                    float(signal.get("stop_price", 0)), sl_swing, sl_atr, float(trade_state["sl"]),
+                    float(trade_state["tp"]), float(trade_state["risk_distance"]),
+                    abs(float(trade_state["tp"]) - float(trade_state["entry_price"])) / float(trade_state["risk_distance"])
+                    if float(trade_state["risk_distance"]) > 0 else 0.0,
+                    atr_val, float(signal.get("score", 0)), exec_type,
+                    float(trade_state["qty"]), margin_to_use,
                 )
 
                 def review_fn(break_even: bool) -> tuple[bool, str]:
@@ -1363,7 +1407,7 @@ def main() -> None:
                     price_fn=price_fn,
                     atr_fn=atr_fn,
                     on_event=on_event,
-                    scale_fn=scale_fn,
+                    scale_fn=None,   # Scaling desactivado hasta validar estrategia en live
                     safety_check_sec=2,
                     review_fn=review_fn,
                     review_sec=7,
@@ -1376,6 +1420,7 @@ def main() -> None:
                     if side == "SELL":
                         pnl = -pnl
                     risk.update_trade(pnl, datetime.now(timezone.utc))
+                    _pos_cache.invalidate()
                     trades_logger.info("exit %s result=%s pnl=%.4f", symbol, result, pnl)
                     return
                 trades_logger.info("exit %s result=%s pnl=0.0", symbol, result)
