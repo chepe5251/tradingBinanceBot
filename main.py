@@ -31,7 +31,7 @@ _TELEGRAM_SEND_LOCK = threading.Lock()
 _TELEGRAM_LAST_SEND_TS = 0.0
 _TELEGRAM_MIN_INTERVAL_SEC = 1.2
 
-MAX_CONCURRENT_POSITIONS = 1   # hard cap on simultaneous open positions
+MAX_CONCURRENT_POSITIONS = 2   # hard cap on simultaneous open positions
 MAX_PER_SYMBOL = 1             # max open positions per symbol (enforced via symbols_with_positions filter)
 
 _ENTRY_LOCK = threading.Lock()  # prevents two intervals from placing orders simultaneously
@@ -757,6 +757,7 @@ def main() -> None:
             elif not can_trade_now:
                 block_reason = "BLOQUEADA POR RISK MANAGER"
 
+            live_count = active_positions  # may be refreshed below
             if execution_allowed:
                 try:
                     live_positions = _pos_cache.get()
@@ -820,7 +821,12 @@ def main() -> None:
                     )
                 )
 
-            symbol, signal = valid_signals[0]
+            # How many new positions can we open this candle?
+            slots_available = max(0, MAX_CONCURRENT_POSITIONS - live_count)
+            # Pick best N candidates (already sorted by score desc)
+            candidates = valid_signals[:max(1, slots_available)]
+
+            symbol, signal = candidates[0]
             side = signal["side"]
 
             if not execution_allowed:
@@ -1426,6 +1432,19 @@ def main() -> None:
                 trades_logger.info("exit %s result=%s pnl=0.0", symbol, result)
 
             threading.Thread(target=protect_and_monitor, daemon=True).start()
+
+            # If a second slot is still open and a second candidate exists,
+            # trigger a fresh on_close pass for the next-best signal.
+            if len(candidates) > 1:
+                _pos_cache.invalidate()
+                with eval_lock:
+                    last_eval_close_ms["value"] = None
+                _second_sym = candidates[1][0]
+                threading.Thread(
+                    target=lambda: on_close(_second_sym),
+                    daemon=True,
+                    name=f"on_close_slot2_{interval}",
+                ).start()
 
         return on_close
 
