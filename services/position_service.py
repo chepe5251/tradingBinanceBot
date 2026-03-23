@@ -19,7 +19,8 @@ if TYPE_CHECKING:
     from data_stream import MarketDataStream
 
 
-PROTECTION_ORDER_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET", "TRAILING_STOP_MARKET"}
+# Binance may return either variant depending on the endpoint and order version
+PROTECTION_ORDER_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET", "TAKE_PROFIT", "STOP", "TRAILING_STOP_MARKET"}
 
 
 def configure_client(api_key: str, api_secret: str, testnet: bool) -> Client:

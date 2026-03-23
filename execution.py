@@ -22,6 +22,10 @@ EXCHANGE_ERRORS = (
     TypeError,
 )
 
+# Binance may return either variant depending on the endpoint and order version
+STOP_ORDER_TYPES: frozenset[str] = frozenset({"STOP", "STOP_MARKET"})
+TP_ORDER_TYPES: frozenset[str] = frozenset({"TAKE_PROFIT", "TAKE_PROFIT_MARKET"})
+
 
 @dataclass
 class OrderResult:
@@ -425,9 +429,10 @@ class FuturesExecutor:
                 if not cid.startswith(client_id_prefix.replace(" ", "")[:20]):
                     continue
             otype = o.get("type") or o.get("orderType")
-            if otype in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
+            # Binance may return either variant depending on endpoint and order version
+            if otype in TP_ORDER_TYPES:
                 tp_ok = True
-            if otype in {"STOP", "STOP_MARKET"}:
+            if otype in STOP_ORDER_TYPES:
                 sl_ok = True
         return tp_ok, sl_ok
 
@@ -456,9 +461,10 @@ class FuturesExecutor:
             if oid is None:
                 continue
             kind = "order" if o.get("orderId") is not None else "algo"
-            if otype in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
+            # Binance may return either variant depending on endpoint and order version
+            if otype in TP_ORDER_TYPES:
                 tp_ref = OrderRef(order_id=int(oid), kind=kind)
-            if otype in {"STOP", "STOP_MARKET"}:
+            if otype in STOP_ORDER_TYPES:
                 sl_ref = OrderRef(order_id=int(oid), kind=kind)
         return tp_ref, sl_ref
 
@@ -474,6 +480,159 @@ class FuturesExecutor:
             quantity=self._round_qty(qty),
             reduceOnly=True,
         )
+
+    # ── Private helpers for monitor_oco ─────────────────────────────────────
+
+    def _check_order_fill_status(
+        self,
+        tp_ref: "OrderRef",
+        sl_ref: "OrderRef",
+        last_replace_ts: float,
+    ) -> tuple[bool, bool, bool, bool]:
+        """Return (tp_filled, sl_filled, tp_open, sl_open) for current orders.
+
+        Applies a 2-second guard after the last replace to avoid false fills
+        from stale exchange state.
+        """
+        if tp_ref.kind == "order":
+            tp = self.client.futures_get_order(symbol=self.symbol, orderId=tp_ref.order_id)
+            tp_open = tp.get("status") not in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
+            tp_filled = tp.get("status") == "FILLED"
+        else:
+            tp_open = self._is_algo_open(tp_ref.order_id)
+            tp_filled = not tp_open
+
+        if sl_ref.kind == "order":
+            sl = self.client.futures_get_order(symbol=self.symbol, orderId=sl_ref.order_id)
+            sl_open = sl.get("status") not in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
+            sl_filled = sl.get("status") == "FILLED"
+        else:
+            sl_open = self._is_algo_open(sl_ref.order_id)
+            sl_filled = not sl_open
+
+        if time.time() - last_replace_ts < 2:
+            tp_filled = False
+            sl_filled = False
+        return tp_filled, sl_filled, tp_open, sl_open
+
+    def _run_safety_check(
+        self,
+        side: str,
+        current_tp: float,
+        current_sl: float,
+        current_qty: float,
+        tp_ref: "OrderRef",
+        sl_ref: "OrderRef",
+        last_safety_check_ts: float,
+        safety_check_sec: int,
+        on_event: Optional[callable],
+        client_id_prefix: Optional[str],
+    ) -> tuple[bool, float, "OrderRef", "OrderRef"]:
+        """Verify TP/SL protections exist; replace if missing.
+
+        Returns: (ok, new_last_safety_check_ts, tp_ref, sl_ref)
+        """
+        if time.time() - last_safety_check_ts < safety_check_sec:
+            return True, last_safety_check_ts, tp_ref, sl_ref
+        tp_ok, sl_ok = self.protection_status(side, client_id_prefix=client_id_prefix)
+        if not (tp_ok and sl_ok):
+            try:
+                tp_ref, sl_ref = self.replace_tp_sl(
+                    side, current_tp, current_sl, current_qty,
+                    client_id_prefix=client_id_prefix,
+                )
+                tp_ok, sl_ok = self.protection_status(side, client_id_prefix=client_id_prefix)
+            except EXCHANGE_ERRORS:
+                tp_ok = False
+                sl_ok = False
+            if not (tp_ok and sl_ok) and on_event:
+                on_event("critical", float(current_sl))
+        return (tp_ok and sl_ok), time.time(), tp_ref, sl_ref
+
+    def _handle_breakeven(
+        self,
+        side: str,
+        price: float,
+        current_entry: float,
+        current_sl: float,
+        current_tp: Optional[float],
+        current_be_trigger: float,
+        break_even: bool,
+        current_qty: float,
+        tp_ref: "OrderRef",
+        sl_ref: "OrderRef",
+        last_replace_ts: float,
+        client_id_prefix: Optional[str],
+        on_event: Optional[callable],
+    ) -> tuple[float, bool, float, "OrderRef", "OrderRef"]:
+        """Move SL to entry when price clears the breakeven trigger level.
+
+        Returns: (new_sl, break_even_activated, new_last_replace_ts, tp_ref, sl_ref)
+        """
+        if break_even or current_be_trigger <= 0:
+            return current_sl, False, last_replace_ts, tp_ref, sl_ref
+        if side == "BUY" and price >= current_entry * (1 + current_be_trigger):
+            new_sl = current_entry
+        elif side == "SELL" and price <= current_entry * (1 - current_be_trigger):
+            new_sl = current_entry
+        else:
+            return current_sl, False, last_replace_ts, tp_ref, sl_ref
+        if time.time() - last_replace_ts < 2:
+            return current_sl, False, last_replace_ts, tp_ref, sl_ref
+        tp_ref, sl_ref = self.replace_tp_sl(
+            side,
+            current_tp if current_tp is not None else current_entry,
+            new_sl,
+            current_qty,
+            client_id_prefix=client_id_prefix,
+        )
+        if on_event:
+            on_event("breakeven", new_sl)
+        return new_sl, True, time.time(), tp_ref, sl_ref
+
+    def _handle_trailing(
+        self,
+        side: str,
+        price: float,
+        current_sl: float,
+        current_tp: Optional[float],
+        current_qty: float,
+        atr_use: float,
+        trail_mult: float,
+        tp_ref: "OrderRef",
+        sl_ref: "OrderRef",
+        last_replace_ts: float,
+        client_id_prefix: Optional[str],
+        on_event: Optional[callable],
+    ) -> tuple[float, Optional[float], float, "OrderRef", "OrderRef"]:
+        """Ratchet SL and TP upward (BUY) or downward (SELL) using ATR trailing.
+
+        Returns: (new_sl, new_tp, new_last_replace_ts, tp_ref, sl_ref)
+        """
+        if side == "BUY":
+            new_sl = price - (atr_use * trail_mult)
+            new_tp = max(float(current_tp or 0.0), price + (atr_use * trail_mult))
+            improve_sl = new_sl > current_sl
+            improve_tp = current_tp is None or new_tp > current_tp
+        else:
+            new_sl = price + (atr_use * trail_mult)
+            new_tp = min(float(current_tp or price), price - (atr_use * trail_mult))
+            improve_sl = new_sl < current_sl
+            improve_tp = current_tp is None or new_tp < current_tp
+        if (improve_sl or improve_tp) and time.time() - last_replace_ts < 2:
+            improve_sl = False
+            improve_tp = False
+        if not (improve_sl or improve_tp):
+            return current_sl, current_tp, last_replace_ts, tp_ref, sl_ref
+        target_sl = new_sl if improve_sl else current_sl
+        target_tp = new_tp if improve_tp else current_tp
+        tp_ref, sl_ref = self.replace_tp_sl(
+            side, target_tp, target_sl, current_qty,
+            client_id_prefix=client_id_prefix,
+        )
+        if on_event:
+            on_event("trail", target_sl)
+        return target_sl, target_tp, time.time(), tp_ref, sl_ref
 
     def monitor_oco(
         self,
@@ -506,40 +665,28 @@ class FuturesExecutor:
         if self.paper:
             return "FILLED", entry_price or 0.0
         break_even = False
-        current_entry = entry_price if entry_price is not None else None
-        current_qty = qty if qty is not None else None
-        current_be_trigger = breakeven_trigger_pct
-        # x20 floor: do not activate BE below 0.5%
-        if current_be_trigger < 0.005:
-            current_be_trigger = 0.005
+        current_entry = entry_price
+        current_qty = qty
+        current_be_trigger = max(float(breakeven_trigger_pct or 0.0), 0.005)  # x20 floor: 0.5%
         effective_trail_activation = max(float(trail_activation_pct or 0.0), 0.01)
-        effective_trail_mult = 0.0
-        if trail_mult > 0:
-            # x20 cap: reduce aggressive trailing multipliers
-            effective_trail_mult = min(float(trail_mult), 0.8)
-        current_tp = tp_price if tp_price is not None else None
-        current_sl = sl_price if sl_price is not None else None
+        effective_trail_mult = min(float(trail_mult), 0.8) if trail_mult > 0 else 0.0  # x20 cap
+        current_tp = tp_price
+        current_sl = sl_price
         last_replace = 0.0
         last_safety_check = 0.0
         last_review = 0.0
 
         while True:
+            # ── Loss-based scaling (disabled by default via scale_fn=None) ───
             if scale_fn and side and current_entry and current_qty and (current_tp is not None) and (current_sl is not None):
                 try:
-                    updates = scale_fn(
-                        {
-                            "entry_price": float(current_entry),
-                            "qty": float(current_qty),
-                            "tp_price": float(current_tp),
-                            "sl_price": float(current_sl),
-                            "break_even": break_even,
-                            "breakeven_trigger_pct": float(current_be_trigger),
-                            "tp_ref": tp_ref,
-                            "sl_ref": sl_ref,
-                        }
-                    )
+                    updates = scale_fn({
+                        "entry_price": float(current_entry), "qty": float(current_qty),
+                        "tp_price": float(current_tp), "sl_price": float(current_sl),
+                        "break_even": break_even, "breakeven_trigger_pct": float(current_be_trigger),
+                        "tp_ref": tp_ref, "sl_ref": sl_ref,
+                    })
                 except Exception:
-                    # scale_fn is caller-provided; any error should skip this cycle only.
                     updates = None
                 if isinstance(updates, dict):
                     if updates.get("close_all"):
@@ -547,50 +694,21 @@ class FuturesExecutor:
                             self.close_position_market(side, float(current_qty))
                         except EXCHANGE_ERRORS:
                             pass
-                        return f"EARLY:{updates.get('reason', 'scale_cancel')}", float(
-                            updates.get("exit_price") or current_entry
-                        )
-                    if "entry_price" in updates and updates["entry_price"]:
-                        current_entry = float(updates["entry_price"])
-                    if "qty" in updates and updates["qty"]:
-                        current_qty = float(updates["qty"])
-                    if "tp_price" in updates and updates["tp_price"] is not None:
-                        current_tp = float(updates["tp_price"])
-                    if "sl_price" in updates and updates["sl_price"] is not None:
-                        current_sl = float(updates["sl_price"])
-                    if "breakeven_trigger_pct" in updates and updates["breakeven_trigger_pct"] is not None:
-                        current_be_trigger = float(updates["breakeven_trigger_pct"])
-                        if current_be_trigger < 0.005:
-                            current_be_trigger = 0.005
-                    if updates.get("tp_ref") is not None:
-                        tp_ref = updates["tp_ref"]
-                    if updates.get("sl_ref") is not None:
-                        sl_ref = updates["sl_ref"]
+                        return f"EARLY:{updates.get('reason', 'scale_cancel')}", float(updates.get("exit_price") or current_entry)
+                    current_entry = float(updates["entry_price"]) if updates.get("entry_price") else current_entry
+                    current_qty = float(updates["qty"]) if updates.get("qty") else current_qty
+                    current_tp = float(updates["tp_price"]) if updates.get("tp_price") is not None else current_tp
+                    current_sl = float(updates["sl_price"]) if updates.get("sl_price") is not None else current_sl
+                    if updates.get("breakeven_trigger_pct") is not None:
+                        current_be_trigger = max(float(updates["breakeven_trigger_pct"]), 0.005)
+                    tp_ref = updates["tp_ref"] if updates.get("tp_ref") is not None else tp_ref
+                    sl_ref = updates["sl_ref"] if updates.get("sl_ref") is not None else sl_ref
                     if updates.get("reset_break_even"):
                         break_even = False
                     last_replace = time.time()
 
-            if tp_ref.kind == "order":
-                tp = self.client.futures_get_order(symbol=self.symbol, orderId=tp_ref.order_id)
-                tp_open = tp.get("status") not in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
-                tp_filled = tp.get("status") == "FILLED"
-            else:
-                tp_open = self._is_algo_open(tp_ref.order_id)
-                tp_filled = False if tp_open else True
-
-            if sl_ref.kind == "order":
-                sl = self.client.futures_get_order(symbol=self.symbol, orderId=sl_ref.order_id)
-                sl_open = sl.get("status") not in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
-                sl_filled = sl.get("status") == "FILLED"
-            else:
-                sl_open = self._is_algo_open(sl_ref.order_id)
-                sl_filled = False if sl_open else True
-
-            # Avoid false closes immediately after replace
-            if time.time() - last_replace < 2:
-                tp_filled = False
-                sl_filled = False
-
+            # ── Check fill status ────────────────────────────────────────────
+            tp_filled, sl_filled, tp_open, sl_open = self._check_order_fill_status(tp_ref, sl_ref, last_replace)
             if tp_filled and sl_open:
                 self.client.futures_cancel_all_open_orders(symbol=self.symbol)
                 return "TP", float(current_tp or 0.0)
@@ -600,35 +718,20 @@ class FuturesExecutor:
             if tp_filled and sl_filled:
                 return "UNKNOWN", float(current_sl or 0.0)
 
-            # Safety: ensure protection always exists (keep retrying)
+            # ── Safety check: ensure protections always exist ────────────────
             if side and current_qty and (current_tp is not None) and (current_sl is not None):
-                if time.time() - last_safety_check >= safety_check_sec:
-                    tp_ok, sl_ok = self.protection_status(side, client_id_prefix=client_id_prefix)
-                    if not (tp_ok and sl_ok):
-                        try:
-                            tp_ref, sl_ref = self.replace_tp_sl(
-                                side,
-                                current_tp,
-                                current_sl,
-                                current_qty,
-                                client_id_prefix=client_id_prefix,
-                            )
-                            tp_ok, sl_ok = self.protection_status(side, client_id_prefix=client_id_prefix)
-                        except EXCHANGE_ERRORS:
-                            tp_ok = False
-                            sl_ok = False
-                        if not (tp_ok and sl_ok) and on_event:
-                            on_event("critical", float(current_sl))
-                    last_safety_check = time.time()
+                _, last_safety_check, tp_ref, sl_ref = self._run_safety_check(
+                    side, current_tp, current_sl, current_qty, tp_ref, sl_ref,
+                    last_safety_check, safety_check_sec, on_event, client_id_prefix,
+                )
 
-            # Active monitoring (structure/volume/trend) every review_sec
+            # ── Active review / early exit ───────────────────────────────────
             if review_fn and side and current_qty and current_entry and time.time() - last_review >= review_sec:
                 last_review = time.time()
                 if not break_even:
                     try:
                         should_exit, reason = review_fn(break_even)
                     except Exception:
-                        # review_fn is strategy-owned logic; monitor must keep running on callback errors.
                         should_exit, reason = False, ""
                     if should_exit:
                         try:
@@ -637,102 +740,40 @@ class FuturesExecutor:
                             pass
                         return f"EARLY:{reason}" if reason else "EARLY", float(price_fn() or current_entry)
 
-            # Trailing / breakeven management
+            # ── Breakeven and trailing management ────────────────────────────
             if side and current_entry and current_qty and price_fn:
                 try:
                     price = float(price_fn())
                 except Exception:
-                    # price_fn can come from external transport and may fail intermittently.
                     price = None
                 if price is not None:
-                    if current_sl is None and current_entry is not None:
+                    if current_sl is None:
                         current_sl = current_entry
                     if not break_even and current_be_trigger > 0:
-                        if side == "BUY" and price >= current_entry * (1 + current_be_trigger):
-                            new_sl = current_entry
-                        elif side == "SELL" and price <= current_entry * (1 - current_be_trigger):
-                            new_sl = current_entry
-                        else:
-                            new_sl = None
-                        if new_sl is not None:
-                            if time.time() - last_replace < 2:
-                                new_sl = None
-                        if new_sl is not None:
-                            tp_ref, sl_ref = self.replace_tp_sl(
-                                side,
-                                current_tp if current_tp is not None else current_entry,
-                                new_sl,
-                                current_qty,
-                                client_id_prefix=client_id_prefix,
-                            )
-                            current_sl = new_sl
+                        current_sl, activated, last_replace, tp_ref, sl_ref = self._handle_breakeven(
+                            side, price, current_entry, current_sl, current_tp, current_be_trigger,
+                            break_even, current_qty, tp_ref, sl_ref, last_replace, client_id_prefix, on_event,
+                        )
+                        if activated:
                             break_even = True
-                            last_replace = time.time()
-                            if on_event:
-                                on_event("breakeven", new_sl)
                     pnl_pct = 0.0
                     if side == "BUY" and current_entry > 0:
                         pnl_pct = (price - current_entry) / current_entry
                     elif side == "SELL" and current_entry > 0:
                         pnl_pct = (current_entry - price) / current_entry
-
                     if break_even and effective_trail_mult > 0 and pnl_pct >= effective_trail_activation:
                         atr_use = atr
                         if atr_fn:
                             try:
                                 atr_use = float(atr_fn())
                             except Exception:
-                                # atr_fn is caller-provided and should be fail-soft.
                                 atr_use = atr
                         if atr_use and atr_use > 0:
-                            if side == "BUY":
-                                new_sl = price - (atr_use * effective_trail_mult)
-                                new_tp = max(float(current_tp or 0.0), price + (atr_use * effective_trail_mult))
-                                improve_sl = new_sl > current_sl
-                                improve_tp = current_tp is None or new_tp > current_tp
-                                if improve_sl or improve_tp:
-                                    if time.time() - last_replace < 2:
-                                        improve_sl = False
-                                        improve_tp = False
-                                if improve_sl or improve_tp:
-                                    target_sl = new_sl if improve_sl else current_sl
-                                    target_tp = new_tp if improve_tp else current_tp
-                                    tp_ref, sl_ref = self.replace_tp_sl(
-                                        side,
-                                        target_tp,
-                                        target_sl,
-                                        current_qty,
-                                        client_id_prefix=client_id_prefix,
-                                    )
-                                    current_sl = target_sl
-                                    current_tp = target_tp
-                                    last_replace = time.time()
-                                    if on_event:
-                                        on_event("trail", current_sl)
-                            else:
-                                new_sl = price + (atr_use * effective_trail_mult)
-                                new_tp = min(float(current_tp or price), price - (atr_use * effective_trail_mult))
-                                improve_sl = new_sl < current_sl
-                                improve_tp = current_tp is None or new_tp < current_tp
-                                if improve_sl or improve_tp:
-                                    if time.time() - last_replace < 2:
-                                        improve_sl = False
-                                        improve_tp = False
-                                if improve_sl or improve_tp:
-                                    target_sl = new_sl if improve_sl else current_sl
-                                    target_tp = new_tp if improve_tp else current_tp
-                                    tp_ref, sl_ref = self.replace_tp_sl(
-                                        side,
-                                        target_tp,
-                                        target_sl,
-                                        current_qty,
-                                        client_id_prefix=client_id_prefix,
-                                    )
-                                    current_sl = target_sl
-                                    current_tp = target_tp
-                                    last_replace = time.time()
-                                    if on_event:
-                                        on_event("trail", current_sl)
+                            current_sl, current_tp, last_replace, tp_ref, sl_ref = self._handle_trailing(
+                                side, price, current_sl, current_tp, current_qty,
+                                atr_use, effective_trail_mult, tp_ref, sl_ref, last_replace,
+                                client_id_prefix, on_event,
+                            )
 
             time.sleep(0.5)
 

@@ -70,7 +70,7 @@ def evaluate_interval_signals(
         if not signal:
             continue
 
-        if interval == "4h" and signal.get("side") == "SELL":
+        if interval in settings.block_sell_on_intervals and signal.get("side") == "SELL":
             continue
 
         signal["timeframe"] = interval.upper()

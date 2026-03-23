@@ -289,9 +289,10 @@ class EntryService:
         )
         if margin_to_use <= 0:
             self.trades_logger.info(
-                "skip %s reason=margin_to_use_invalid mode=%s avail=%.4f",
+                "skip %s reason=margin_to_use_invalid mode=%s pct=%.4f avail=%.4f",
                 symbol,
                 self.settings.sizing_mode,
+                self.settings.risk_per_trade_pct,
                 available_balance,
             )
             return False

@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from sizing import SIZING_MODE_FIXED_MARGIN, normalize_sizing_mode
+from sizing import SIZING_MODE_PCT_BALANCE, normalize_sizing_mode
 
 
 @dataclass
@@ -33,9 +33,9 @@ class Settings:
     paper_start_balance: float = 25.0
 
     # Sizing and position control
-    sizing_mode: str = SIZING_MODE_FIXED_MARGIN
+    sizing_mode: str = SIZING_MODE_PCT_BALANCE
     fixed_margin_per_trade_usdt: float = 5.0
-    risk_per_trade_pct: float = 0.10
+    risk_per_trade_pct: float = 0.05  # 5% of available balance per position
     margin_utilization: float = 0.95
     max_positions: int = 2
     use_limit_only: bool = False
@@ -83,9 +83,13 @@ class Settings:
     anti_liq_trigger_r: float = 1.1
 
     # Scaling controls (currently disabled by monitor runtime)
+    enable_loss_scaling: bool = False  # DCA on losing positions — only enable after exhaustive backtest
     scale_level1_margin_usdt: float = 5.0
     scale_level2_margin_usdt: float = 0.0
     scale_level2_atr_mult: float = 0.4
+
+    # Signal filtering
+    block_sell_on_intervals: list[str] = field(default_factory=lambda: ["4h"])
 
     # Data/history and logs
     history_candles_main: int = 600
@@ -276,6 +280,12 @@ def from_env() -> Settings:
     _set_float(settings, "scale_level1_margin_usdt", "SCALE_LEVEL1_MARGIN_USDT", minimum=0.0)
     _set_float(settings, "scale_level2_margin_usdt", "SCALE_LEVEL2_MARGIN_USDT", minimum=0.0)
     _set_float(settings, "scale_level2_atr_mult", "SCALE_LEVEL2_ATR_MULT", minimum=0.0)
+
+    _set_bool(settings, "enable_loss_scaling", "ENABLE_LOSS_SCALING")
+
+    raw = os.getenv("BLOCK_SELL_ON_INTERVALS")
+    if raw:
+        settings.block_sell_on_intervals = _parse_list(raw)
 
     # Keep legacy TOP_SYMBOLS_LIMIT behavior as fallback for top count.
     if settings.top_volume_symbols_count <= 0 and settings.top_symbols_limit > 0:

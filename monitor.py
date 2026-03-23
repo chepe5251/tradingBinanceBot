@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceOrderException, BinanceRequestException
 
-from execution import FuturesExecutor
+from execution import FuturesExecutor, STOP_ORDER_TYPES, TP_ORDER_TYPES
 from indicators import atr_last, safe_mark_price
 from monitor_logic import evaluate_early_exit
 from risk import RiskManager
@@ -136,11 +136,30 @@ class PositionMonitor:
         return should_exit, reason
 
     def _scale_fn(self, state: dict) -> dict | None:
-        """Evaluate and execute loss-based scaling stages while preserving protections.
+        """Evaluate and execute loss-based DCA scaling stages for a losing position.
 
-        Currently unused (passed as scale_fn=None to monitor_oco).  Kept here
-        so it can be re-enabled without touching main.py.
+        What it does:
+            Adds margin to the position in 3 progressive levels when floating
+            loss exceeds 50%, 100%, and 200% of the initial margin respectively.
+            Level 3 can add up to 4× the initial margin to an already-losing trade.
+
+        Why it is disabled:
+            This is an unvalidated martingale-style strategy.  In live conditions
+            it amplifies losses on directional moves against the position.
+            Do not enable until a full backtest with realistic slippage confirms
+            positive expectancy.
+
+        How to activate:
+            Set ENABLE_LOSS_SCALING=true in .env **only** after exhaustive backtest.
+            The field ``enable_loss_scaling`` in Settings controls the guard below.
+
+        Maximum risk:
+            Level 3 adds 4× the initial margin to a position already down 200%.
+            Total risk exposure per trade can be 8× the entry margin.
         """
+        if not getattr(self.settings, "enable_loss_scaling", False):
+            return None
+
         now_ts = time.time()
         level_state = self.level_state
         trade_state = self.trade_state
@@ -430,7 +449,7 @@ class PositionMonitor:
             price_fn=self.price_fn,
             atr_fn=self.atr_fn,
             on_event=self.on_event,
-            scale_fn=None,   # Scaling desactivado hasta validar estrategia en live
+            scale_fn=None,  # _scale_fn desactivado — ver enable_loss_scaling en Settings
             safety_check_sec=2,
             review_fn=self._review_fn,
             review_sec=7,
@@ -503,9 +522,10 @@ class PositionMonitor:
                 sp = float(o.get("stopPrice", 0) or 0)
                 if sp <= 0:
                     continue
-                if ot == "STOP_MARKET" and sl_price is None:
+                # Binance may return either variant depending on endpoint and order version
+                if ot in STOP_ORDER_TYPES and sl_price is None:
                     sl_price = sp
-                elif ot == "TAKE_PROFIT_MARKET" and tp_price is None:
+                elif ot in TP_ORDER_TYPES and tp_price is None:
                     tp_price = sp
         except MONITOR_ERRORS as exc:
             logger.warning("Orphan recovery: could not fetch open orders: %s", exc)
@@ -620,7 +640,7 @@ class PositionMonitor:
                 price_fn=_price_fn,
                 atr_fn=_atr_fn,
                 on_event=_on_event,
-                scale_fn=None,
+                scale_fn=None,  # _scale_fn desactivado — ver enable_loss_scaling en Settings
                 safety_check_sec=2,
                 review_fn=None,
                 review_sec=7,
