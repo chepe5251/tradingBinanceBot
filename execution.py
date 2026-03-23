@@ -11,6 +11,16 @@ from decimal import Decimal
 from typing import Optional
 
 from binance import Client
+from binance.exceptions import BinanceAPIException, BinanceOrderException, BinanceRequestException
+
+EXCHANGE_ERRORS = (
+    BinanceAPIException,
+    BinanceOrderException,
+    BinanceRequestException,
+    OSError,
+    ValueError,
+    TypeError,
+)
 
 
 @dataclass
@@ -57,7 +67,7 @@ class FuturesExecutor:
                 continue
             try:
                 f = float(v)
-            except Exception:
+            except (TypeError, ValueError):
                 continue
             if f > 0:
                 return f
@@ -175,7 +185,7 @@ class FuturesExecutor:
             return
         try:
             self.client.futures_change_margin_type(symbol=self.symbol, marginType=self.margin_type)
-        except Exception:
+        except EXCHANGE_ERRORS:
             pass
         lev = self.leverage
         while lev >= 1:
@@ -183,7 +193,7 @@ class FuturesExecutor:
                 self.client.futures_change_leverage(symbol=self.symbol, leverage=lev)
                 self.leverage = lev
                 break
-            except Exception as exc:
+            except EXCHANGE_ERRORS as exc:
                 msg = str(exc)
                 if "-4028" in msg and lev > 1:
                     lev = max(1, lev - 5)
@@ -275,7 +285,7 @@ class FuturesExecutor:
         # Not filled within timeout: cancel and market remaining
         try:
             self.client.futures_cancel_order(symbol=self.symbol, orderId=order_id)
-        except Exception:
+        except EXCHANGE_ERRORS:
             pass
 
         remaining = max(0.0, qty - executed_qty)
@@ -380,7 +390,7 @@ class FuturesExecutor:
         if not self.paper:
             try:
                 self.client.futures_cancel_all_open_orders(symbol=self.symbol)
-            except Exception:
+            except EXCHANGE_ERRORS:
                 pass
         return self.place_tp_sl(side, tp_price, sl_price, qty, client_id_prefix=client_id_prefix)
 
@@ -405,7 +415,7 @@ class FuturesExecutor:
         sl_ok = False
         try:
             orders = self.client.futures_get_open_orders(symbol=self.symbol)
-        except Exception:
+        except EXCHANGE_ERRORS:
             return False, False
         for o in orders:
             if o.get("side") != exit_side:
@@ -432,7 +442,7 @@ class FuturesExecutor:
         sl_ref = None
         try:
             orders = self.client.futures_get_open_orders(symbol=self.symbol)
-        except Exception:
+        except EXCHANGE_ERRORS:
             return None, None
         for o in orders:
             if o.get("side") != exit_side:
@@ -529,12 +539,13 @@ class FuturesExecutor:
                         }
                     )
                 except Exception:
+                    # scale_fn is caller-provided; any error should skip this cycle only.
                     updates = None
                 if isinstance(updates, dict):
                     if updates.get("close_all"):
                         try:
                             self.close_position_market(side, float(current_qty))
-                        except Exception:
+                        except EXCHANGE_ERRORS:
                             pass
                         return f"EARLY:{updates.get('reason', 'scale_cancel')}", float(
                             updates.get("exit_price") or current_entry
@@ -603,7 +614,7 @@ class FuturesExecutor:
                                 client_id_prefix=client_id_prefix,
                             )
                             tp_ok, sl_ok = self.protection_status(side, client_id_prefix=client_id_prefix)
-                        except Exception:
+                        except EXCHANGE_ERRORS:
                             tp_ok = False
                             sl_ok = False
                         if not (tp_ok and sl_ok) and on_event:
@@ -617,11 +628,12 @@ class FuturesExecutor:
                     try:
                         should_exit, reason = review_fn(break_even)
                     except Exception:
+                        # review_fn is strategy-owned logic; monitor must keep running on callback errors.
                         should_exit, reason = False, ""
                     if should_exit:
                         try:
                             self.close_position_market(side, current_qty)
-                        except Exception:
+                        except EXCHANGE_ERRORS:
                             pass
                         return f"EARLY:{reason}" if reason else "EARLY", float(price_fn() or current_entry)
 
@@ -630,6 +642,7 @@ class FuturesExecutor:
                 try:
                     price = float(price_fn())
                 except Exception:
+                    # price_fn can come from external transport and may fail intermittently.
                     price = None
                 if price is not None:
                     if current_sl is None and current_entry is not None:
@@ -669,6 +682,7 @@ class FuturesExecutor:
                             try:
                                 atr_use = float(atr_fn())
                             except Exception:
+                                # atr_fn is caller-provided and should be fail-soft.
                                 atr_use = atr
                         if atr_use and atr_use > 0:
                             if side == "BUY":
@@ -726,7 +740,7 @@ class FuturesExecutor:
         """Return whether an algo/order identifier is still present in open orders."""
         try:
             orders = self.client.futures_get_open_orders(symbol=self.symbol)
-        except Exception:
+        except EXCHANGE_ERRORS:
             return False
         for o in orders:
             oid = o.get("algoId") or o.get("orderId")

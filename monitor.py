@@ -18,75 +18,28 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Optional
 
-import pandas as pd
 from binance import Client
+from binance.exceptions import BinanceAPIException, BinanceOrderException, BinanceRequestException
 
 from execution import FuturesExecutor
+from indicators import atr_last, safe_mark_price
+from monitor_logic import evaluate_early_exit
 from risk import RiskManager
+
+MONITOR_ERRORS = (
+    BinanceAPIException,
+    BinanceOrderException,
+    BinanceRequestException,
+    OSError,
+    ValueError,
+    TypeError,
+)
 
 if TYPE_CHECKING:
     from config import Settings
     from data_stream import MarketDataStream
 
 
-# ── Local indicator helpers (mirror of main.py utilities) ────────────────────
-
-def _ema(series: pd.Series, period: int) -> pd.Series:
-    """Compute exponential moving average."""
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def _context_direction(df: pd.DataFrame, ema_period: int) -> Optional[str]:
-    """Infer directional bias from close price versus EMA."""
-    if df.empty or len(df) < ema_period:
-        return None
-    ema = _ema(df["close"], ema_period)
-    if ema.isna().iloc[-1]:
-        return None
-    return "LONG" if df["close"].iloc[-1] > ema.iloc[-1] else "SHORT"
-
-
-def _context_slope(df: pd.DataFrame, ema_period: int) -> float:
-    """Compute normalized EMA slope as trend-strength proxy."""
-    if df.empty or len(df) < ema_period + 2:
-        return 0.0
-    ema = _ema(df["close"], ema_period)
-    last = ema.iloc[-1]
-    prev = ema.iloc[-2]
-    if prev == 0 or prev != prev:
-        return 0.0
-    return (last - prev) / prev
-
-
-def _calc_atr(df: pd.DataFrame, period: int) -> float:
-    """Compute the latest ATR value using EWMA true range."""
-    if df.empty or len(df) < period + 2:
-        return 0.0
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    prev_close = close.shift(1)
-    tr = (
-        (high - low).abs()
-        .to_frame("hl")
-        .join((high - prev_close).abs().to_frame("hc"))
-        .join((low - prev_close).abs().to_frame("lc"))
-        .max(axis=1)
-    )
-    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
-    return float(atr.iloc[-1]) if not atr.isna().iloc[-1] else 0.0
-
-
-def _get_mark_price(client: Client, symbol: str) -> Optional[float]:
-    """Fetch mark price for one symbol; return None on API error."""
-    try:
-        data = client.futures_mark_price(symbol=symbol)
-        return float(data.get("markPrice"))
-    except Exception:
-        return None
-
-
-# ── PositionMonitor ──────────────────────────────────────────────────────────
 
 class PositionMonitor:
     """Supervises an open position from TP/SL placement through to exit.
@@ -112,7 +65,6 @@ class PositionMonitor:
         price_fn: Callable[[], Optional[float]],
         atr_fn: Callable[[], Optional[float]],
         on_event: Callable[[str, float], None],
-        tg_send: Callable[[str], None],
         pos_cache_invalidate: Callable[[], None],
         risk_updater: Callable[[float, datetime], None],
         min_qty: float = 0.0,
@@ -139,7 +91,6 @@ class PositionMonitor:
         self.price_fn = price_fn
         self.atr_fn = atr_fn
         self.on_event = on_event
-        self.tg_send = tg_send
         self.pos_cache_invalidate = pos_cache_invalidate
         self.risk_updater = risk_updater
         self.min_qty = min_qty
@@ -156,45 +107,18 @@ class PositionMonitor:
     def _review_fn(self, break_even: bool) -> tuple[bool, str]:
         """Run structure/volume/context reviews for potential early exits."""
         settings = self.settings
-        _df = self.stream.get_dataframe(self.symbol, self.interval)
-        _ctx = _df
-        if _df.empty or len(_df) < max(
-            settings.ema_mid, settings.ema_fast, settings.volume_avg_window + 2, 4
-        ):
-            return False, "no_data"
-
-        ema20 = _ema(_df["close"], settings.ema_fast)
-        ema50 = _ema(_df["close"], settings.ema_mid)
-        last = _df.iloc[-1]
-        ema20_last = ema20.iloc[-1]
-        ema20_prev = ema20.iloc[-2]
-        ema50_last = ema50.iloc[-1]
-        ema50_prev = ema50.iloc[-2]
-
-        candle_range = last["high"] - last["low"]
-        body = abs(last["close"] - last["open"])
-        strong_body = candle_range > 0 and (body / candle_range) >= 0.6
-
-        if self.side == "BUY":
-            cross_against = ema20_prev >= ema50_prev and ema20_last < ema50_last
-            close_against = last["close"] < ema50_last
-            struct_break = cross_against and close_against and strong_body
-            vol_against = last["close"] < last["open"]
-        else:
-            cross_against = ema20_prev <= ema50_prev and ema20_last > ema50_last
-            close_against = last["close"] > ema50_last
-            struct_break = cross_against and close_against and strong_body
-            vol_against = last["close"] > last["open"]
-
-        vol_avg = _df["volume"].iloc[-(settings.volume_avg_window + 1):-1].mean()
-        vol_strong = bool(vol_avg) and last["volume"] >= 2 * vol_avg
-        volume_break = vol_strong and vol_against and struct_break
-
-        ctx_dir = _context_direction(_ctx, settings.ema_trend)
-        ctx_slope = _context_slope(_ctx, settings.ema_trend)
-        ctx_changed = (
-            ctx_dir == "SHORT" if self.side == "BUY" else ctx_dir == "LONG"
-        ) and abs(ctx_slope) >= settings.trend_slope_min
+        df = self.stream.get_dataframe(self.symbol, self.interval)
+        should_exit, reason, metrics = evaluate_early_exit(
+            df=df,
+            side=self.side,
+            ema_fast_period=settings.ema_fast,
+            ema_mid_period=settings.ema_mid,
+            ema_trend_period=settings.ema_trend,
+            volume_avg_window=settings.volume_avg_window,
+            trend_slope_min=settings.trend_slope_min,
+            break_even=break_even,
+            context_df=df,
+        )
 
         tp_ok, sl_ok = self.executor.protection_status(
             self.side, client_id_prefix=self.client_id_prefix
@@ -204,21 +128,12 @@ class PositionMonitor:
             self.symbol,
             tp_ok,
             sl_ok,
-            ctx_dir or "NONE",
-            ctx_slope,
-            struct_break,
-            vol_strong,
+            metrics.get("ctx_dir") or "NONE",
+            float(metrics.get("ctx_slope") or 0.0),
+            bool(metrics.get("struct_break")),
+            bool(metrics.get("vol_strong")),
         )
-
-        if break_even:
-            return False, "break_even_active"
-        if volume_break:
-            return True, "volume_break"
-        if struct_break:
-            return True, "structure_break"
-        if ctx_changed:
-            return True, "ctx_flip"
-        return False, ""
+        return should_exit, reason
 
     def _scale_fn(self, state: dict) -> dict | None:
         """Evaluate and execute loss-based scaling stages while preserving protections.
@@ -351,7 +266,7 @@ class PositionMonitor:
                 add_filled, add_avg = add_qty, mark
             else:
                 add_filled, add_avg = self.executor.place_market_entry(self.side, add_qty)
-        except Exception as exc:
+        except MONITOR_ERRORS as exc:
             _defer_level(level_key, "loss_scale_market_error", exc)
             return None
         if add_filled <= 0:
@@ -392,7 +307,7 @@ class PositionMonitor:
                     client_id_prefix=self.client_id_prefix,
                 )
                 break
-            except Exception as exc:
+            except MONITOR_ERRORS as exc:
                 replace_exc = exc
                 time.sleep(min(replace_attempt, 2))
         if not new_tp_ref or not new_sl_ref:
@@ -441,7 +356,7 @@ class PositionMonitor:
             if not self.executor.paper:
                 try:
                     has_pos = self.executor.has_open_position()
-                except Exception:
+                except MONITOR_ERRORS:
                     has_pos = False
                 if not has_pos:
                     if time.time() < position_wait_deadline:
@@ -467,7 +382,7 @@ class PositionMonitor:
                 )
                 if tp_ref and sl_ref:
                     break
-            except Exception as exc:
+            except MONITOR_ERRORS as exc:
                 self.logger.error("TP/SL placement failed %s: %s", self.symbol, exc)
                 self.trades_logger.info("error %s stage=tp_sl msg=%s", self.symbol, exc)
 
@@ -563,7 +478,7 @@ class PositionMonitor:
             qty = abs(float(orphan.get("positionAmt", 0)))
             entry_price = float(orphan.get("entryPrice", 0))
             side = "BUY" if float(orphan.get("positionAmt", 0)) > 0 else "SELL"
-        except Exception as exc:
+        except (TypeError, ValueError) as exc:
             logger.warning("Orphan recovery: could not parse position data: %s", exc)
             return
 
@@ -592,11 +507,11 @@ class PositionMonitor:
                     sl_price = sp
                 elif ot == "TAKE_PROFIT_MARKET" and tp_price is None:
                     tp_price = sp
-        except Exception as exc:
+        except MONITOR_ERRORS as exc:
             logger.warning("Orphan recovery: could not fetch open orders: %s", exc)
 
         df_orphan = stream.get_dataframe(symbol, settings.main_interval)
-        atr_orphan = _calc_atr(df_orphan, settings.atr_period) if not df_orphan.empty else 0.0
+        atr_orphan = atr_last(df_orphan, settings.atr_period) if not df_orphan.empty else 0.0
 
         if sl_price is None:
             sl_price = (
@@ -633,11 +548,11 @@ class PositionMonitor:
         client_id_prefix = f"{symbol}-orphan-{int(time.time() * 1000)}"
 
         def _price_fn() -> Optional[float]:
-            return _get_mark_price(trade_client, symbol)
+            return safe_mark_price(trade_client, symbol, logger=logger)
 
         def _atr_fn() -> Optional[float]:
             _df = stream.get_dataframe(symbol, settings.main_interval)
-            return _calc_atr(_df, settings.atr_period)
+            return atr_last(_df, settings.atr_period)
 
         def _on_event(kind: str, new_sl: float) -> None:
             trades_logger.info("%s %s new_sl=%.4f (orphan)", kind, symbol, new_sl)
@@ -650,7 +565,7 @@ class PositionMonitor:
             while True:
                 try:
                     has_pos = executor.has_open_position()
-                except Exception:
+                except MONITOR_ERRORS:
                     has_pos = False
                 if not has_pos:
                     if time.time() < position_wait_deadline:
@@ -675,7 +590,7 @@ class PositionMonitor:
                     )
                     if tp_ref and sl_ref:
                         break
-                except Exception as exc:
+                except MONITOR_ERRORS as exc:
                     logger.error("Orphan TP/SL placement failed %s: %s", symbol, exc)
 
                 attempts += 1

@@ -1,46 +1,46 @@
-"""Configuration model and environment loading for the trading bot.
-
-This module centralizes runtime settings so the rest of the codebase can
-consume a typed `Settings` object instead of querying environment variables
-directly.
-"""
+"""Configuration model and environment loading for the trading bot."""
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 
+from sizing import SIZING_MODE_FIXED_MARGIN, normalize_sizing_mode
+
 
 @dataclass
 class Settings:
-    """Runtime configuration consumed by strategy, execution, and risk layers.
+    """Runtime configuration consumed by strategy, execution, and risk layers."""
 
-    Values are initialized with safe defaults and then overridden in `from_env`.
-    The bot expects a single immutable snapshot of this dataclass during
-    process startup.
-    """
-
-    # Trading
+    # Trading universe and intervals
     symbol: str = "BTCUSDT"
     symbols: list[str] = field(default_factory=list)
     extra_symbols: list[str] = field(default_factory=list)
-    use_top_volume_symbols: bool = False
-    top_volume_symbols_count: int = 0
+    use_top_volume_symbols: bool = True
+    top_volume_symbols_count: int = 80
     top_volume_allowlist: list[str] = field(default_factory=list)
     top_volume_min_price: float = 0.0
     top_volume_min_quote_volume: float = 0.0
     main_interval: str = "15m"
     context_interval: str = "1h"
+    top_symbols_limit: int = 80  # legacy alias used as fallback
 
+    # Exchange/account
     leverage: int = 20
     margin_type: str = "ISOLATED"
     use_testnet: bool = True
     data_use_testnet: bool = False
-
-    # Capital management
-    margin_utilization: float = 0.50  # use 50% of available balance as margin
+    use_paper_trading: bool = False
     paper_start_balance: float = 25.0
 
-    # Indicators
+    # Sizing and position control
+    sizing_mode: str = SIZING_MODE_FIXED_MARGIN
+    fixed_margin_per_trade_usdt: float = 5.0
+    risk_per_trade_pct: float = 0.10
+    margin_utilization: float = 0.95
+    max_positions: int = 2
+    use_limit_only: bool = False
+
+    # Strategy indicators
     ema_fast: int = 20
     ema_mid: int = 50
     ema_trend: int = 200
@@ -49,231 +49,240 @@ class Settings:
     volume_avg_window: int = 20
     trend_slope_min: float = 0.00005
     rsi_period: int = 14
-    rsi_long_min: float = 40.0
-    rsi_long_max: float = 70.0
-    rsi_short_min: float = 30.0
-    rsi_short_max: float = 60.0
-    volume_min_ratio: float = 1.0
+    rsi_long_min: float = 48.0
+    rsi_long_max: float = 68.0
+    volume_min_ratio: float = 1.05
+    volume_max_ratio: float = 1.5
+    pullback_tolerance_atr: float = 0.8
+    min_ema_spread_atr: float = 0.15
+    max_ema_spread_atr: float = 1.0
+    min_body_ratio: float = 0.35
+    rr_target: float = 2.0
+    min_risk_atr: float = 0.5
+    max_risk_atr: float = 3.0
+    min_score: float = 1.5
 
-    # ATR-based targets
+    # ATR-based management
     atr_sl_mult: float = 1.6
     atr_tp_mult: float = 1.8
     atr_trail_mult: float = 1.0
-    min_sl_pct: float = 0.007  # 0.7%
-    breakeven_trigger_pct: float = 0.006  # 0.6%
-    trailing_activation_pct: float = 0.010  # 1.0%
+    min_sl_pct: float = 0.007
+    breakeven_trigger_pct: float = 0.006
+    trailing_activation_pct: float = 0.010
+    stop_atr_mult: float = 1.2
+    tp_rr: float = 1.8
 
-    # Entry/management
-    limit_offset_pct: float = 0.0001  # 0.01%
+    # Entry/management risk
+    limit_offset_pct: float = 0.0001
     limit_timeout_sec: int = 6
     cooldown_sec: int = 180
     max_consecutive_losses: int = 3
-    daily_drawdown_limit: float = 0.20  # legacy pct drawdown guard
+    daily_drawdown_limit: float = 0.20
     daily_drawdown_limit_usdt: float = 6.0
-    risk_pause_after_losses_sec: int = 86400  # pause until end of UTC day
-    risk_per_trade_pct: float = 0.10
-    fixed_margin_per_trade_usdt: float = 5.0
+    risk_pause_after_losses_sec: int = 86400
+    anti_liq_trigger_r: float = 1.1
+
+    # Scaling controls (currently disabled by monitor runtime)
     scale_level1_margin_usdt: float = 5.0
     scale_level2_margin_usdt: float = 0.0
     scale_level2_atr_mult: float = 0.4
-    stop_atr_mult: float = 1.2
-    tp_rr: float = 1.8
-    anti_liq_trigger_r: float = 1.1
 
-    # Position control
-    max_positions: int = 1
-    use_limit_only: bool = True
-    use_paper_trading: bool = False
+    # Data/history and logs
+    history_candles_main: int = 600
+    history_candles_context: int = 400
     log_heartbeat_sec: int = 60
     log_candle_updates: bool = False
     log_candle_every_sec: int = 60
 
-    # Data
-    history_candles_main: int = 600
-    history_candles_context: int = 400
-    top_symbols_limit: int = 80
-
 
 def load_env(path: str = ".env") -> None:
-    """Populate `os.environ` from a dotenv-style file.
-
-    Existing environment variables are preserved and never overwritten.
-    The parser is intentionally small: `KEY=VALUE` lines are supported and
-    comments/blank lines are ignored.
-    """
-
+    """Populate `os.environ` from a dotenv-style file without overwriting values."""
     if not os.path.exists(path):
         return
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+    with open(path, "r", encoding="utf-8") as file:
+        for line in file:
             line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
+            if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
             key = key.strip()
-            value = value.strip().strip("\"").strip("'")
+            value = value.strip().strip('"').strip("'")
             if key and key not in os.environ:
                 os.environ[key] = value
 
 
 def _parse_bool(value: str) -> bool:
-    """Parse common truthy string values."""
     return value.lower() in {"1", "true", "yes", "on"}
 
 
 def _parse_list(value: str) -> list[str]:
-    """Parse a comma-separated symbol list and normalize it to uppercase."""
-    return [v.strip().upper() for v in value.split(",") if v.strip()]
+    return [item.strip().upper() for item in value.split(",") if item.strip()]
+
+
+def _set_int(settings: Settings, field_name: str, env_name: str, minimum: int | None = None) -> None:
+    raw = os.getenv(env_name)
+    if raw is None or raw == "":
+        return
+    try:
+        value = int(raw)
+    except ValueError:
+        return
+    if minimum is not None:
+        value = max(minimum, value)
+    setattr(settings, field_name, value)
+
+
+def _set_float(
+    settings: Settings,
+    field_name: str,
+    env_name: str,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> None:
+    raw = os.getenv(env_name)
+    if raw is None or raw == "":
+        return
+    try:
+        value = float(raw)
+    except ValueError:
+        return
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    setattr(settings, field_name, value)
+
+
+def _set_bool(settings: Settings, field_name: str, env_name: str) -> None:
+    raw = os.getenv(env_name)
+    if raw is None:
+        return
+    setattr(settings, field_name, _parse_bool(raw))
+
+
+def _set_str(settings: Settings, field_name: str, env_name: str) -> None:
+    raw = os.getenv(env_name)
+    if raw is None or raw.strip() == "":
+        return
+    setattr(settings, field_name, raw.strip())
 
 
 def from_env() -> Settings:
-    """Build a validated `Settings` instance from environment variables.
-
-    This function also enforces operational bounds (for example, utilization
-    and risk caps) so callers always receive sane values.
-    """
-
+    """Build a validated `Settings` instance from environment variables."""
     load_env()
     settings = Settings()
-    testnet = os.getenv("BINANCE_TESTNET", "true").lower() in {"1", "true", "yes"}
-    settings.use_testnet = testnet
-    data_testnet = os.getenv("BINANCE_DATA_TESTNET")
-    if data_testnet is not None:
-        settings.data_use_testnet = _parse_bool(data_testnet)
-    else:
-        settings.data_use_testnet = False
 
-    margin_util = os.getenv("MARGIN_UTILIZATION")
-    if margin_util:
-        try:
-            settings.margin_utilization = float(margin_util)
-        except ValueError:
-            pass
-    if settings.margin_utilization < 0.5:
-        settings.margin_utilization = 0.5
-    if settings.margin_utilization > 0.95:
-        settings.margin_utilization = 0.95
+    _set_bool(settings, "use_testnet", "BINANCE_TESTNET")
+    _set_bool(settings, "data_use_testnet", "BINANCE_DATA_TESTNET")
+    _set_bool(settings, "use_paper_trading", "USE_PAPER_TRADING")
 
-    risk_per_trade = os.getenv("RISK_PER_TRADE_PCT")
-    if risk_per_trade:
-        try:
-            settings.risk_per_trade_pct = float(risk_per_trade)
-        except ValueError:
-            pass
-    if settings.risk_per_trade_pct < 0.01:
-        settings.risk_per_trade_pct = 0.01
-    if settings.risk_per_trade_pct > 0.20:
-        settings.risk_per_trade_pct = 0.20
+    _set_str(settings, "symbol", "SYMBOL")
+    symbols_raw = os.getenv("SYMBOLS")
+    if symbols_raw:
+        settings.symbols = _parse_list(symbols_raw)
+    extra_symbols_raw = os.getenv("EXTRA_SYMBOLS")
+    if extra_symbols_raw:
+        settings.extra_symbols = _parse_list(extra_symbols_raw)
 
-    fixed_margin = os.getenv("FIXED_MARGIN_PER_TRADE_USDT")
-    if fixed_margin:
-        try:
-            settings.fixed_margin_per_trade_usdt = float(fixed_margin)
-        except ValueError:
-            pass
-    if settings.fixed_margin_per_trade_usdt < 1.0:
-        settings.fixed_margin_per_trade_usdt = 1.0
+    _set_bool(settings, "use_top_volume_symbols", "USE_TOP_VOLUME_SYMBOLS")
+    _set_int(settings, "top_volume_symbols_count", "TOP_VOLUME_SYMBOLS_COUNT", minimum=0)
+    _set_int(settings, "top_symbols_limit", "TOP_SYMBOLS_LIMIT", minimum=0)
+    _set_float(settings, "top_volume_min_price", "TOP_VOLUME_MIN_PRICE", minimum=0.0)
+    _set_float(
+        settings,
+        "top_volume_min_quote_volume",
+        "TOP_VOLUME_MIN_QUOTE_VOLUME",
+        minimum=0.0,
+    )
+    allowlist_raw = os.getenv("TOP_VOLUME_ALLOWLIST")
+    if allowlist_raw:
+        settings.top_volume_allowlist = _parse_list(allowlist_raw)
 
-    scale_l1_margin = os.getenv("SCALE_LEVEL1_MARGIN_USDT")
-    if scale_l1_margin:
-        try:
-            settings.scale_level1_margin_usdt = float(scale_l1_margin)
-        except ValueError:
-            pass
-    if settings.scale_level1_margin_usdt < 0.0:
-        settings.scale_level1_margin_usdt = 0.0
+    _set_str(settings, "main_interval", "MAIN_INTERVAL")
+    _set_str(settings, "context_interval", "CONTEXT_INTERVAL")
 
-    scale_l2_margin = os.getenv("SCALE_LEVEL2_MARGIN_USDT")
-    if scale_l2_margin:
-        try:
-            settings.scale_level2_margin_usdt = float(scale_l2_margin)
-        except ValueError:
-            pass
-    if settings.scale_level2_margin_usdt < 0.0:
-        settings.scale_level2_margin_usdt = 0.0
+    _set_int(settings, "history_candles_main", "HISTORY_CANDLES_MAIN", minimum=120)
+    _set_int(settings, "history_candles_context", "HISTORY_CANDLES_CONTEXT", minimum=120)
+    _set_int(settings, "log_heartbeat_sec", "LOG_HEARTBEAT_SEC", minimum=5)
+    _set_bool(settings, "log_candle_updates", "LOG_CANDLE_UPDATES")
+    _set_int(settings, "log_candle_every_sec", "LOG_CANDLE_EVERY_SEC", minimum=5)
 
-    anti_liq_trigger = os.getenv("ANTI_LIQ_TRIGGER_R")
-    if anti_liq_trigger:
-        try:
-            settings.anti_liq_trigger_r = float(anti_liq_trigger)
-        except ValueError:
-            pass
+    _set_int(settings, "leverage", "LEVERAGE", minimum=1)
+    _set_str(settings, "margin_type", "MARGIN_TYPE")
 
-    dd_usdt = os.getenv("DAILY_DRAWDOWN_LIMIT_USDT")
-    if dd_usdt:
-        try:
-            settings.daily_drawdown_limit_usdt = float(dd_usdt)
-        except ValueError:
-            pass
-    if settings.daily_drawdown_limit_usdt < 1.0:
-        settings.daily_drawdown_limit_usdt = 1.0
+    _set_float(settings, "paper_start_balance", "PAPER_START_BALANCE", minimum=1.0)
+    _set_str(settings, "sizing_mode", "SIZING_MODE")
+    settings.sizing_mode = normalize_sizing_mode(settings.sizing_mode)
+    _set_float(
+        settings,
+        "fixed_margin_per_trade_usdt",
+        "FIXED_MARGIN_PER_TRADE_USDT",
+        minimum=1.0,
+    )
+    _set_float(settings, "risk_per_trade_pct", "RISK_PER_TRADE_PCT", minimum=0.01, maximum=0.20)
+    _set_float(settings, "margin_utilization", "MARGIN_UTILIZATION", minimum=0.50, maximum=0.95)
+    _set_int(settings, "max_positions", "MAX_POSITIONS", minimum=1)
+    _set_bool(settings, "use_limit_only", "USE_LIMIT_ONLY")
 
-    max_consec = os.getenv("MAX_CONSECUTIVE_LOSSES")
-    if max_consec:
-        try:
-            settings.max_consecutive_losses = max(1, int(max_consec))
-        except ValueError:
-            pass
+    _set_int(settings, "ema_fast", "EMA_FAST", minimum=2)
+    _set_int(settings, "ema_mid", "EMA_MID", minimum=2)
+    _set_int(settings, "ema_trend", "EMA_TREND", minimum=20)
+    _set_int(settings, "atr_period", "ATR_PERIOD", minimum=2)
+    _set_int(settings, "atr_avg_window", "ATR_AVG_WINDOW", minimum=2)
+    _set_int(settings, "volume_avg_window", "VOLUME_AVG_WINDOW", minimum=2)
+    _set_float(settings, "trend_slope_min", "TREND_SLOPE_MIN", minimum=0.0)
+    _set_int(settings, "rsi_period", "RSI_PERIOD", minimum=2)
+    _set_float(settings, "rsi_long_min", "RSI_LONG_MIN", minimum=0.0, maximum=100.0)
+    _set_float(settings, "rsi_long_max", "RSI_LONG_MAX", minimum=0.0, maximum=100.0)
+    _set_float(settings, "volume_min_ratio", "VOLUME_MIN_RATIO", minimum=0.0)
+    _set_float(settings, "volume_max_ratio", "VOLUME_MAX_RATIO", minimum=0.0)
+    _set_float(settings, "pullback_tolerance_atr", "PULLBACK_TOLERANCE_ATR", minimum=0.0)
+    _set_float(settings, "min_ema_spread_atr", "MIN_EMA_SPREAD_ATR", minimum=0.0)
+    _set_float(settings, "max_ema_spread_atr", "MAX_EMA_SPREAD_ATR", minimum=0.0)
+    _set_float(settings, "min_body_ratio", "MIN_BODY_RATIO", minimum=0.0, maximum=1.0)
+    _set_float(settings, "rr_target", "RR_TARGET", minimum=0.1)
+    _set_float(settings, "min_risk_atr", "MIN_RISK_ATR", minimum=0.0)
+    _set_float(settings, "max_risk_atr", "MAX_RISK_ATR", minimum=0.0)
+    _set_float(settings, "min_score", "MIN_SCORE", minimum=0.0)
 
-    pause_sec = os.getenv("RISK_PAUSE_AFTER_LOSSES_SEC")
-    if pause_sec:
-        try:
-            settings.risk_pause_after_losses_sec = max(60, int(pause_sec))
-        except ValueError:
-            pass
+    _set_float(settings, "atr_sl_mult", "ATR_SL_MULT", minimum=0.0)
+    _set_float(settings, "atr_tp_mult", "ATR_TP_MULT", minimum=0.0)
+    _set_float(settings, "atr_trail_mult", "ATR_TRAIL_MULT", minimum=0.0)
+    _set_float(settings, "min_sl_pct", "MIN_SL_PCT", minimum=0.0)
+    _set_float(settings, "breakeven_trigger_pct", "BREAKEVEN_TRIGGER_PCT", minimum=0.0)
+    _set_float(settings, "trailing_activation_pct", "TRAILING_ACTIVATION_PCT", minimum=0.0)
+    _set_float(settings, "stop_atr_mult", "STOP_ATR_MULT", minimum=0.0)
+    _set_float(settings, "tp_rr", "TP_RR", minimum=0.1)
 
-    paper_balance = os.getenv("PAPER_START_BALANCE")
-    if paper_balance:
-        try:
-            settings.paper_start_balance = float(paper_balance)
-        except ValueError:
-            pass
+    _set_float(settings, "limit_offset_pct", "LIMIT_OFFSET_PCT", minimum=0.0)
+    _set_int(settings, "limit_timeout_sec", "LIMIT_TIMEOUT_SEC", minimum=1)
+    _set_int(settings, "cooldown_sec", "COOLDOWN_SEC", minimum=0)
+    _set_int(settings, "max_consecutive_losses", "MAX_CONSECUTIVE_LOSSES", minimum=1)
+    _set_float(settings, "daily_drawdown_limit", "DAILY_DRAWDOWN_LIMIT", minimum=0.0, maximum=1.0)
+    _set_float(
+        settings,
+        "daily_drawdown_limit_usdt",
+        "DAILY_DRAWDOWN_LIMIT_USDT",
+        minimum=1.0,
+    )
+    _set_int(
+        settings,
+        "risk_pause_after_losses_sec",
+        "RISK_PAUSE_AFTER_LOSSES_SEC",
+        minimum=60,
+    )
+    _set_float(settings, "anti_liq_trigger_r", "ANTI_LIQ_TRIGGER_R", minimum=0.0)
 
-    use_paper = os.getenv("USE_PAPER_TRADING")
-    if use_paper is not None:
-        settings.use_paper_trading = _parse_bool(use_paper)
+    _set_float(settings, "scale_level1_margin_usdt", "SCALE_LEVEL1_MARGIN_USDT", minimum=0.0)
+    _set_float(settings, "scale_level2_margin_usdt", "SCALE_LEVEL2_MARGIN_USDT", minimum=0.0)
+    _set_float(settings, "scale_level2_atr_mult", "SCALE_LEVEL2_ATR_MULT", minimum=0.0)
 
-    log_updates = os.getenv("LOG_CANDLE_UPDATES")
-    if log_updates is not None:
-        settings.log_candle_updates = _parse_bool(log_updates)
+    # Keep legacy TOP_SYMBOLS_LIMIT behavior as fallback for top count.
+    if settings.top_volume_symbols_count <= 0 and settings.top_symbols_limit > 0:
+        settings.top_volume_symbols_count = settings.top_symbols_limit
 
-    log_every = os.getenv("LOG_CANDLE_EVERY_SEC")
-    if log_every:
-        try:
-            settings.log_candle_every_sec = int(log_every)
-        except ValueError:
-            pass
-
-    top_limit = os.getenv("TOP_SYMBOLS_LIMIT")
-    if top_limit:
-        try:
-            settings.top_symbols_limit = max(1, int(top_limit))
-        except ValueError:
-            pass
-
-    symbols = os.getenv("SYMBOLS")
-    if symbols:
-        settings.symbols = _parse_list(symbols)
-
-    extra_symbols = os.getenv("EXTRA_SYMBOLS")
-    if extra_symbols:
-        settings.extra_symbols = _parse_list(extra_symbols)
-
-    use_top = os.getenv("USE_TOP_VOLUME_SYMBOLS")
-    if use_top is not None:
-        settings.use_top_volume_symbols = _parse_bool(use_top)
-
-    top_count = os.getenv("TOP_VOLUME_SYMBOLS_COUNT")
-    if top_count:
-        try:
-            settings.top_volume_symbols_count = max(0, int(top_count))
-        except ValueError:
-            pass
-
-    allowlist = os.getenv("TOP_VOLUME_ALLOWLIST")
-    if allowlist:
-        settings.top_volume_allowlist = _parse_list(allowlist)
+    # Keep RSI bounds coherent if configured inversely.
+    if settings.rsi_long_min > settings.rsi_long_max:
+        settings.rsi_long_min, settings.rsi_long_max = settings.rsi_long_max, settings.rsi_long_min
 
     return settings

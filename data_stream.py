@@ -2,13 +2,8 @@
 
 `MarketDataStream` is responsible for:
 - Bootstrapping historical klines for all tracked intervals/symbols.
-- Polling closed candles at each M15 boundary via Binance REST API.
+- Polling closed candles on scheduler boundaries via Binance REST API.
 - Providing thread-safe dataframe snapshots to strategy/execution code.
-
-Replacing the previous WebSocket multiplex approach with a REST scheduler
-reduces open connections from 22 streams to zero while maintaining correct
-behavior, since strategy evaluation only needs closed candles (fired at
-fixed :00/:15/:30/:45 boundaries for M15).
 """
 from __future__ import annotations
 
@@ -20,29 +15,15 @@ from typing import Callable, Dict, Optional
 
 import pandas as pd
 from binance import Client
+from binance.exceptions import BinanceAPIException, BinanceRequestException
 from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
-
-def _kline_to_row(k: dict) -> dict:
-    """Normalize a websocket kline payload into the internal row schema."""
-    return {
-        "open_time": int(k["t"]),
-        "open": float(k["o"]),
-        "high": float(k["h"]),
-        "low": float(k["l"]),
-        "close": float(k["c"]),
-        "volume": float(k["v"]),
-        "close_time": int(k["T"]),
-    }
-
+DATA_ERRORS = (BinanceAPIException, BinanceRequestException, OSError, ValueError, TypeError)
 
 class MarketDataStream:
-    """Thread-safe wrapper around Binance threaded websocket klines.
-
-    The class keeps a bounded in-memory deque per `(interval, symbol)` pair.
-    """
+    """Thread-safe REST poller with bounded in-memory candle caches."""
 
     _INTERVAL_SECONDS: dict[str, int] = {
         "1m": 60, "3m": 180, "5m": 300, "15m": 900,
@@ -56,6 +37,7 @@ class MarketDataStream:
         symbols: list[str],
         main_interval: str,
         main_limit: int,
+        # Legacy parameters kept for backward-compatible constructor calls.
         api_key: str = "",
         api_secret: str = "",
         testnet: bool = False,
@@ -88,19 +70,12 @@ class MarketDataStream:
                     continue
                 self._candles[interval] = {s: deque(maxlen=limit) for s in self.symbols}
 
-        self._on_close_callbacks: Dict[str, Optional[Callable[[str], None]]] = {}
+        self._on_close_callbacks: Dict[str, Optional[Callable[[], None]]] = {}
         self._last_closed_ts: Optional[int] = None
         self._last_closed_wall: Optional[float] = None
         self._event_count: int = 0
         self._stop_event = threading.Event()
         self._scheduler_thread: Optional[threading.Thread] = None
-
-    @staticmethod
-    def _chunks(items: list[str], size: int) -> list[list[str]]:
-        """Split a list into fixed-size chunks."""
-        if size <= 0:
-            size = 1
-        return [items[i:i + size] for i in range(0, len(items), size)]
 
     def load_initial(self) -> None:
         """Hydrate each cache with historical klines before streaming starts."""
@@ -114,7 +89,7 @@ class MarketDataStream:
                             symbol=symbol, interval=interval, limit=sym_map[symbol].maxlen
                         )
                         break
-                    except Exception as exc:
+                    except DATA_ERRORS as exc:
                         if attempt == 3:
                             logger.warning(
                                 "Initial klines failed %s %s after %s attempts: %s",
@@ -162,7 +137,7 @@ class MarketDataStream:
         """Fetch the latest `limit` closed klines and update the in-memory cache."""
         try:
             klines = self.client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-        except Exception as exc:
+        except DATA_ERRORS as exc:
             logger.debug("REST fetch failed %s %s: %s", symbol, interval, exc)
             return
         rows = [
@@ -238,11 +213,12 @@ class MarketDataStream:
                 # so elapsed ≤ 30 s reliably covers all newly-closed intervals.
                 if now_wall % period <= 30.0 and self.symbols:
                     try:
-                        callback(self.symbols[0])
+                        callback()
                     except Exception as exc:
+                        # Keep broad catch: callbacks are caller-provided and must not stop scheduler.
                         logger.error("on_close[%s] raised: %s", iv, exc)
 
-    def start_scheduler(self, on_close_callbacks: Dict[str, Callable[[str], None]]) -> None:
+    def start_scheduler(self, on_close_callbacks: Dict[str, Callable[[], None]]) -> None:
         """Start the REST-based scheduler and register per-interval close callbacks."""
         self._on_close_callbacks = dict(on_close_callbacks)
         self._stop_event.clear()
@@ -258,7 +234,10 @@ class MarketDataStream:
         self._stop_event.set()
 
     def restart_if_stale(self, max_idle_sec: int) -> None:
-        """No-op kept for API compatibility; scheduler is self-correcting."""
+        """Legacy no-op kept for API compatibility.
+
+        The REST scheduler is timer-driven and does not require stale restarts.
+        """
 
     def get_dataframe(self, symbol: str, interval: str) -> pd.DataFrame:
         """Return a pandas snapshot for `(symbol, interval)` in UTC timestamps."""

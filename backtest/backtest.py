@@ -50,38 +50,59 @@ from binance import Client
 
 # ── strategy import (one level up) ───────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import from_env  # noqa: E402
+from indicators import atr_series, ema, rsi  # noqa: E402
 from strategy import evaluate_signal  # noqa: E402
 
 # ── configuration ─────────────────────────────────────────────────────────────
-TOP_SYMBOLS = 250
-INTERVALS = ["15m", "1h", "4h"]
+APP_SETTINGS = from_env()
+if APP_SETTINGS.use_top_volume_symbols:
+    TOP_SYMBOLS = APP_SETTINGS.top_volume_symbols_count or APP_SETTINGS.top_symbols_limit
+else:
+    TOP_SYMBOLS = APP_SETTINGS.top_symbols_limit
+MAIN_INTERVAL = APP_SETTINGS.main_interval
+CONTEXT_INTERVAL = APP_SETTINGS.context_interval
+HIGHER_INTERVAL = {"15m": "1h", "1h": "4h"}.get(CONTEXT_INTERVAL, "4h")
+INTERVALS: list[str] = []
+for _interval in [MAIN_INTERVAL, CONTEXT_INTERVAL, HIGHER_INTERVAL]:
+    if _interval and _interval not in INTERVALS:
+        INTERVALS.append(_interval)
+
 CANDLES_PER_INTERVAL: dict[str, int] = {
-    "15m": 1500,  # ~15.6 días, weight 10/req. Bajar a 999 = ~10.4 días, weight 5/req
-    "1h":  720,   # ~30 días, weight 5/req
-    "4h":  500,   # ~83 días, weight 5/req
+    MAIN_INTERVAL: max(1500, APP_SETTINGS.history_candles_main),
+    CONTEXT_INTERVAL: max(720, APP_SETTINGS.history_candles_context),
 }
+if HIGHER_INTERVAL not in CANDLES_PER_INTERVAL:
+    CANDLES_PER_INTERVAL[HIGHER_INTERVAL] = max(500, APP_SETTINGS.history_candles_context)
+
 INITIAL_CAPITAL = 500.0
-MARGIN_PER_TRADE = 5.0
-LEVERAGE = 20
+MARGIN_PER_TRADE = APP_SETTINGS.fixed_margin_per_trade_usdt
+LEVERAGE = APP_SETTINGS.leverage
 COMMISSION_PCT = 0.0004   # 0.04 % per side (taker)
-ATR_PERIOD = 14
+ATR_PERIOD = APP_SETTINGS.atr_period
 
-# evaluate_signal parameters — same defaults as main.py
+# evaluate_signal parameters aligned with live settings
 _EVAL_KWARGS: dict = dict(
-    ema_trend=200,
-    ema_fast=20,
-    ema_mid=50,
+    ema_trend=APP_SETTINGS.ema_trend,
+    ema_fast=APP_SETTINGS.ema_fast,
+    ema_mid=APP_SETTINGS.ema_mid,
     atr_period=ATR_PERIOD,
-    atr_avg_window=20,
-    volume_avg_window=20,
-    rsi_period=14,
-    rsi_long_min=40.0,
-    rsi_long_max=70.0,
-    rsi_short_min=30.0,
-    rsi_short_max=60.0,
-    volume_min_ratio=1.0,
+    atr_avg_window=APP_SETTINGS.atr_avg_window,
+    volume_avg_window=APP_SETTINGS.volume_avg_window,
+    rsi_period=APP_SETTINGS.rsi_period,
+    rsi_long_min=APP_SETTINGS.rsi_long_min,
+    rsi_long_max=APP_SETTINGS.rsi_long_max,
+    volume_min_ratio=APP_SETTINGS.volume_min_ratio,
+    volume_max_ratio=APP_SETTINGS.volume_max_ratio,
+    pullback_tolerance_atr=APP_SETTINGS.pullback_tolerance_atr,
+    min_ema_spread_atr=APP_SETTINGS.min_ema_spread_atr,
+    max_ema_spread_atr=APP_SETTINGS.max_ema_spread_atr,
+    min_body_ratio=APP_SETTINGS.min_body_ratio,
+    rr_target=APP_SETTINGS.rr_target,
+    min_risk_atr=APP_SETTINGS.min_risk_atr,
+    max_risk_atr=APP_SETTINGS.max_risk_atr,
+    min_score=APP_SETTINGS.min_score,
 )
-
 MAX_CANDLES_HOLD = 50   # close at market after this many candles
 SKIP_AFTER_SIGNAL = 10  # skip candles after a signal to avoid overlap
 MAX_DL_WORKERS = 60     # threads para descarga I/O (rate limiter controla la velocidad real)
@@ -126,25 +147,14 @@ _rate_limiter = RateLimiter()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _load_env() -> dict[str, str]:
-    """Load key=value pairs from ../.env relative to this script."""
-    env: dict[str, str] = {}
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
-    env_path = os.path.normpath(env_path)
-    if not os.path.exists(env_path):
-        return env
-    with open(env_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            env[key.strip()] = val.strip().strip('"').strip("'")
-    return env
-
-
 def _load_symbols(client: Client) -> list[str]:
     """Return top TOP_SYMBOLS USDT-M perpetual symbols by 24h quote volume."""
+    configured_symbols = list(dict.fromkeys(APP_SETTINGS.symbols + APP_SETTINGS.extra_symbols))
+    if configured_symbols and not APP_SETTINGS.use_top_volume_symbols:
+        if TOP_SYMBOLS > 0:
+            return configured_symbols[:TOP_SYMBOLS]
+        return configured_symbols
+
     try:
         info = client.futures_exchange_info()
     except Exception as exc:
@@ -165,19 +175,35 @@ def _load_symbols(client: Client) -> list[str]:
         tickers = client.futures_ticker()
     except Exception as exc:
         print(f"[ERROR] futures_ticker: {exc}")
-        return sorted(perp)[:TOP_SYMBOLS]
+        ranked_fallback = sorted(perp)
+        return ranked_fallback[:TOP_SYMBOLS] if TOP_SYMBOLS > 0 else ranked_fallback
 
     vol_map: dict[str, float] = {}
+    price_map: dict[str, float] = {}
     for t in tickers:
         sym = t.get("symbol", "")
         if sym in perp:
             try:
                 vol_map[sym] = float(t.get("quoteVolume", 0) or 0)
+                price_map[sym] = float(t.get("lastPrice", 0) or 0)
             except Exception:
                 vol_map[sym] = 0.0
+                price_map[sym] = 0.0
 
     ranked = sorted(perp, key=lambda s: vol_map.get(s, 0.0), reverse=True)
-    return ranked[:TOP_SYMBOLS]
+    if APP_SETTINGS.top_volume_min_quote_volume > 0 or APP_SETTINGS.top_volume_min_price > 0:
+        ranked = [
+            symbol
+            for symbol in ranked
+            if vol_map.get(symbol, 0.0) >= APP_SETTINGS.top_volume_min_quote_volume
+            and price_map.get(symbol, 0.0) >= APP_SETTINGS.top_volume_min_price
+        ] or ranked
+
+    top_symbols = ranked[:TOP_SYMBOLS] if TOP_SYMBOLS > 0 else ranked
+    for symbol in APP_SETTINGS.top_volume_allowlist:
+        if symbol in perp and symbol not in top_symbols:
+            top_symbols.append(symbol)
+    return top_symbols
 
 
 def _fetch_klines(client: Client, symbol: str, interval: str, limit: int) -> pd.DataFrame:
@@ -223,47 +249,36 @@ def _fmt_ts(ts) -> str:
 # ── local indicator helpers (for extra CSV fields) ────────────────────────────
 
 def _ema_col(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+    return ema(series, period)
 
 
 def _atr_col(df: pd.DataFrame, period: int) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False).mean()
+    return atr_series(df, period)
 
 
 def _rsi_col(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return rsi(series, period)
 
 
 # ── simulation ────────────────────────────────────────────────────────────────
 
-def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list[dict], int, int]:
+def _simulate_trades(
+    df: pd.DataFrame,
+    symbol: str,
+    interval: str,
+    context_df: pd.DataFrame | None = None,
+) -> tuple[list[dict], int, int]:
     """Walk through df candle-by-candle and simulate every signal.
 
     Returns (trades, skipped_4h_sell, skipped_low_score).
     """
     # Precompute indicators once for extra CSV fields
-    ema20   = _ema_col(df["close"], 20)
-    ema50   = _ema_col(df["close"], 50)
-    ema200  = _ema_col(df["close"], 200)
+    ema20   = _ema_col(df["close"], APP_SETTINGS.ema_fast)
+    ema50   = _ema_col(df["close"], APP_SETTINGS.ema_mid)
+    ema200  = _ema_col(df["close"], APP_SETTINGS.ema_trend)
     atr     = _atr_col(df, ATR_PERIOD)
-    avg_vol = df["volume"].rolling(20).mean()
-    rsi     = _rsi_col(df["close"], 14)
+    avg_vol = df["volume"].rolling(APP_SETTINGS.volume_avg_window).mean()
+    rsi     = _rsi_col(df["close"], APP_SETTINGS.rsi_period)
 
     trades: list[dict] = []
     skipped_4h_sell = 0
@@ -277,8 +292,13 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
 
     while i < n - 1:
         sub = df.iloc[: i + 1]
+        if context_df is not None and not context_df.empty:
+            cutoff = sub.iloc[-1]["close_time"]
+            context_sub = context_df.loc[context_df["close_time"] <= cutoff]
+        else:
+            context_sub = pd.DataFrame()
         try:
-            signal = evaluate_signal(sub, pd.DataFrame(), **_EVAL_KWARGS)
+            signal = evaluate_signal(sub, context_sub, **_EVAL_KWARGS)
         except Exception:
             i += 1
             continue
@@ -288,7 +308,7 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
             continue
 
         # Mirror production filters exactly
-        if interval == "4h" and signal.get("side") == "SELL":
+        if interval == HIGHER_INTERVAL and signal.get("side") == "SELL":
             skipped_4h_sell += 1
             i += 1
             continue
@@ -913,21 +933,27 @@ def _download_one(args: tuple) -> tuple[str, str, pd.DataFrame | None, str | Non
 # ── simulation task (top-level for pickle / ProcessPoolExecutor) ──────────────
 
 def _simulate_task(args: tuple) -> tuple[str, str, list[dict], int, int]:
-    """Pickleable wrapper for ProcessPoolExecutor — Fase 2."""
-    df_dict, sym, interval = args
+    """Pickleable wrapper for ProcessPoolExecutor - Phase 2."""
+    df_dict, context_dict, sym, interval = args
     df = pd.DataFrame(df_dict)
-    df["open_time"]  = pd.to_datetime(df["open_time"],  utc=True)
+    df["open_time"] = pd.to_datetime(df["open_time"], utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], utc=True)
-    trades, s4h, ssc = _simulate_trades(df, sym, interval)
+
+    context_df = pd.DataFrame()
+    if context_dict:
+        context_df = pd.DataFrame(context_dict)
+        context_df["open_time"] = pd.to_datetime(context_df["open_time"], utc=True)
+        context_df["close_time"] = pd.to_datetime(context_df["close_time"], utc=True)
+
+    trades, s4h, ssc = _simulate_trades(df, sym, interval, context_df=context_df)
     return sym, interval, trades, s4h, ssc
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    env = _load_env()
-    api_key    = env.get("BINANCE_API_KEY", "")
-    api_secret = env.get("BINANCE_API_SECRET", "")
+    api_key = os.getenv("BINANCE_API_KEY", "")
+    api_secret = os.getenv("BINANCE_API_SECRET", "")
 
     client = Client(api_key, api_secret)
 
@@ -985,17 +1011,32 @@ def main() -> None:
     print(f"  Usando {SIM_WORKERS} procesos paralelos")
 
     # Serializar DataFrames a dicts para pickle eficiente
+    context_by_interval: dict[str, str] = {MAIN_INTERVAL: CONTEXT_INTERVAL}
+    if CONTEXT_INTERVAL != HIGHER_INTERVAL:
+        context_by_interval[CONTEXT_INTERVAL] = HIGHER_INTERVAL
+
     sim_args = []
     for (sym, interval), df in kline_data.items():
         df_send = df.copy()
-        df_send["open_time"]  = df_send["open_time"].astype(str)
+        df_send["open_time"] = df_send["open_time"].astype(str)
         df_send["close_time"] = df_send["close_time"].astype(str)
-        sim_args.append((df_send.to_dict("list"), sym, interval))
+
+        context_dict: dict = {}
+        context_interval = context_by_interval.get(interval)
+        if context_interval:
+            context_df = kline_data.get((sym, context_interval))
+            if context_df is not None and not context_df.empty:
+                context_send = context_df.copy()
+                context_send["open_time"] = context_send["open_time"].astype(str)
+                context_send["close_time"] = context_send["close_time"].astype(str)
+                context_dict = context_send.to_dict("list")
+
+        sim_args.append((df_send.to_dict("list"), context_dict, sym, interval))
     del kline_data  # liberar memoria
 
     t1 = time.time()
     with ProcessPoolExecutor(max_workers=SIM_WORKERS) as executor:
-        futures = {executor.submit(_simulate_task, args): (args[1], args[2])
+        futures = {executor.submit(_simulate_task, args): (args[2], args[3])
                    for args in sim_args}
         for future in as_completed(futures):
             sim_done += 1
@@ -1047,3 +1088,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+

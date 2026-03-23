@@ -1,9 +1,17 @@
 ﻿# Python
 __pycache__/
 *.pyc
+.venv/
+.ruff_cache/
 
 # Env
 .env
 
 # Logs
 logs/
+
+# Local tooling
+.claude/
+
+# Backtest outputs
+backtest/results/
