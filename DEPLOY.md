@@ -35,17 +35,24 @@ docker compose down
 ```
 
 ## 4. Health expectations
-Typical scheduler/heartbeat log pattern:
+
+Typical startup log pattern (verify your `.env` here — no secrets exposed):
 ```text
+INFO | Startup | mode=LIVE leverage=20x sizing=pct_balance pct=5% max_pos=2 symbols=300 intervals=['15m', '1h', '4h'] hold=50 candles
+INFO | Strategy config | ema=20/50/200 atr=14 rsi=48-68 vol=1.05-1.50x body>=0.35 score>=1.5 rr=2.0
 INFO | Loaded 300 symbols by top-volume filter.
-INFO | Scheduler init | symbols=300 intervals=['15m', '1h', '4h']
-INFO | Scheduler: polling 300 symbols x 3 intervals via REST
+INFO | Starting scheduler symbols=300 intervals=['15m', '1h', '4h']
 INFO | Heartbeat: bot alive | polls=... scheduler=True
 ```
 
 Container healthcheck is based on `logs/.alive` (updated every `LOG_HEARTBEAT_SEC` seconds).
 
 Risk state is persisted to `logs/risk_state.json` and reloaded automatically on restart.
+
+### Validating `.env` without exposing secrets
+Check the `Startup |` log line immediately after launch. It shows mode, leverage, sizing, max
+positions, symbol count, and intervals — everything needed to confirm configuration is loaded
+correctly, without echoing any API keys or secrets.
 
 ## 5. Safety
 - Start with `BINANCE_TESTNET=true` first.

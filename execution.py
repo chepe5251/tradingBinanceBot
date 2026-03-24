@@ -190,6 +190,8 @@ class FuturesExecutor:
         try:
             self.client.futures_change_margin_type(symbol=self.symbol, marginType=self.margin_type)
         except EXCHANGE_ERRORS:
+            # Silently tolerated: exchange rejects margin-type change when a position is already open
+            # or the symbol is already in the requested mode.  Neither case is an error worth aborting.
             pass
         lev = self.leverage
         while lev >= 1:

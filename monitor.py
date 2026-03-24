@@ -47,7 +47,6 @@ if TYPE_CHECKING:
     from data_stream import MarketDataStream
 
 
-
 class PositionMonitor:
     """Supervises an open position from TP/SL placement through to exit.
 

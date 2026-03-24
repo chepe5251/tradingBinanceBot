@@ -283,6 +283,20 @@ def bootstrap_runtime(settings: Settings, api_key: str, api_secret: str) -> Runt
     risk = _build_risk_manager(settings)
     risk.load("logs/risk_state.json")
 
+    mode = "PAPER" if settings.use_paper_trading else ("TESTNET" if settings.use_testnet else "LIVE")
+    logger.info(
+        "Startup | mode=%s leverage=%dx sizing=%s pct=%.0f%% "
+        "max_pos=%d symbols=%d intervals=%s hold=%d candles",
+        mode,
+        settings.leverage,
+        settings.sizing_mode,
+        settings.risk_per_trade_pct * 100,
+        settings.max_positions,
+        len(symbols),
+        evaluation_intervals,
+        settings.max_hold_candles,
+    )
+
     cfg = strategy_config_from_settings(settings)
     logger.info(
         "Strategy config | ema=%d/%d/%d atr=%d rsi=%.0f-%.0f "

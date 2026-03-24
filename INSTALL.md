@@ -63,11 +63,24 @@ Output CSV files are generated in `backtest/results/`.
 
 ## 5. Run tests
 ```bash
+# All tests
 python -m pytest tests/ -v
+
+# Unit tests only (pure logic, no network)
+python -m pytest tests/ -v -m unit
+
+# Integration tests only
+python -m pytest tests/ -v -m integration
+
+# With coverage report for core modules
+python -m pytest tests/ \
+  --cov=risk --cov=strategy --cov=sizing \
+  --cov=execution --cov=monitor_logic --cov=indicators \
+  --cov-report=term-missing
 ```
 
-Tests run without a Binance API key. The pytest `pythonpath = ["."]` config in
-`pyproject.toml` ensures module imports resolve correctly from the repo root.
+All 31 tests run without a Binance API key. `pyproject.toml` adds the repo root to `sys.path`
+automatically via `pythonpath = ["."]`.
 
 ## 6. Common checks
 - Missing API keys in live mode: bot fails fast at startup

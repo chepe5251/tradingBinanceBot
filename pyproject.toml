@@ -6,6 +6,24 @@ markers = [
     "unit: pure-logic tests with no network or filesystem I/O",
     "integration: tests that wire multiple real components together",
 ]
+addopts = "--tb=short"
+
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    ".venv/*",
+    "backtest/*",
+    "setup.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
+show_missing = true
 
 [tool.ruff]
 line-length = 100

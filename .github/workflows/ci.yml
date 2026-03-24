@@ -42,6 +42,14 @@ jobs:
       - name: Run integration tests
         run: python -m pytest tests/ -v -m integration
 
+      - name: Coverage report (core modules)
+        run: |
+          python -m pytest tests/ \
+            --cov=risk --cov=strategy --cov=sizing \
+            --cov=execution --cov=monitor_logic --cov=indicators \
+            --cov-report=term-missing \
+            -q
+
   docker-build:
     name: Docker build check
     runs-on: ubuntu-latest
