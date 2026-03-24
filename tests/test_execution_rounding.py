@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
+
 from execution import FuturesExecutor
 from sizing import is_entry_size_valid
 
@@ -27,6 +29,7 @@ class _FakeClient:
         }
 
 
+@pytest.mark.unit
 class ExecutionRoundingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.executor = FuturesExecutor(

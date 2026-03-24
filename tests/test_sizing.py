@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
+
 from sizing import SIZING_MODE_PCT_BALANCE, PositionSizer, SizingInputs, normalize_sizing_mode
 
 
@@ -20,6 +22,7 @@ def _make_inputs(**overrides) -> SizingInputs:
     return SizingInputs(**defaults)
 
 
+@pytest.mark.unit
 class PctBalanceSizingTests(unittest.TestCase):
     def test_5pct_of_200_gives_10(self) -> None:
         sizer = PositionSizer(SIZING_MODE_PCT_BALANCE)

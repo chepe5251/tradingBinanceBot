@@ -59,11 +59,13 @@ def evaluate_interval_signals(
     """Evaluate all symbols for one timeframe and return sorted candidates."""
     valid_signals: list[SignalCandidate] = []
     cfg = strategy_config_from_settings(settings)
+    scanned = 0
 
     for symbol in symbols:
         symbol_df = stream.get_dataframe(symbol, interval)
         if symbol_df.empty:
             continue
+        scanned += 1
 
         context_df = (
             stream.get_dataframe(symbol, context_interval) if context_interval else pd.DataFrame()
@@ -87,4 +89,10 @@ def evaluate_interval_signals(
         valid_signals.append(SignalCandidate(symbol=symbol, interval=interval, payload=signal))
 
     valid_signals.sort(key=lambda item: item.score, reverse=True)
+    trades_logger.debug(
+        "scan tf=%s scanned=%d signals=%d",
+        interval,
+        scanned,
+        len(valid_signals),
+    )
     return valid_signals

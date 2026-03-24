@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import pandas as pd
+import pytest
 
 from monitor_logic import evaluate_early_exit
 
@@ -30,6 +31,7 @@ def _build_monitor_df() -> pd.DataFrame:
     )
 
 
+@pytest.mark.unit
 class MonitorLogicTests(unittest.TestCase):
     def test_detects_structure_or_volume_break(self) -> None:
         df = _build_monitor_df()

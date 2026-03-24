@@ -23,6 +23,7 @@ from services.position_service import (
     get_available_balance,
     has_any_position_or_entry_order,
 )
+from services.signal_service import strategy_config_from_settings
 
 DEFAULT_HTF_MAP: dict[str, str] = {
     "1m": "5m",
@@ -281,6 +282,19 @@ def bootstrap_runtime(settings: Settings, api_key: str, api_secret: str) -> Runt
 
     risk = _build_risk_manager(settings)
     risk.load("logs/risk_state.json")
+
+    cfg = strategy_config_from_settings(settings)
+    logger.info(
+        "Strategy config | ema=%d/%d/%d atr=%d rsi=%.0f-%.0f "
+        "vol=%.2f-%.2fx body>=%.2f score>=%.1f rr=%.1f",
+        cfg.ema_fast, cfg.ema_mid, cfg.ema_trend,
+        cfg.atr_period,
+        cfg.rsi_long_min, cfg.rsi_long_max,
+        cfg.volume_min_ratio, cfg.volume_max_ratio,
+        cfg.min_body_ratio,
+        cfg.min_score,
+        cfg.rr_target,
+    )
     if settings.use_paper_trading:
         risk.init_equity(settings.paper_start_balance)
     else:

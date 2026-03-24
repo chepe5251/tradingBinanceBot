@@ -2,6 +2,10 @@
 # Add repo root to sys.path so tests import project modules without installation.
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "unit: pure-logic tests with no network or filesystem I/O",
+    "integration: tests that wire multiple real components together",
+]
 
 [tool.ruff]
 line-length = 100

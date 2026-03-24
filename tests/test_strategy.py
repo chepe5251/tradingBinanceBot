@@ -4,6 +4,7 @@ import unittest
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from strategy import StrategyConfig, evaluate_signal
 
@@ -69,6 +70,7 @@ def _base_cfg() -> StrategyConfig:
     )
 
 
+@pytest.mark.unit
 class StrategyTests(unittest.TestCase):
     def test_returns_signal_on_controlled_dataset(self) -> None:
         df = _build_candidate_dataframe()
@@ -103,6 +105,42 @@ class StrategyTests(unittest.TestCase):
         strict_cfg = StrategyConfig(**{**_base_cfg().__dict__, "min_score": 2.5})
         stricter = evaluate_signal(df, df.copy(), strict_cfg)
         self.assertIsNone(stricter)
+
+    def test_empty_dataframe_returns_none(self) -> None:
+        signal = evaluate_signal(pd.DataFrame(), pd.DataFrame(), _base_cfg())
+        self.assertIsNone(signal)
+
+    def test_too_short_dataframe_returns_none(self) -> None:
+        df = _build_candidate_dataframe().iloc[:5].copy()
+        signal = evaluate_signal(df, pd.DataFrame(), _base_cfg())
+        self.assertIsNone(signal)
+
+    def test_atr_avg_ratio_filter_blocks_spike(self) -> None:
+        """A candle with ATR >> recent average must be rejected."""
+        df = _build_candidate_dataframe()
+        # max_atr_avg_ratio = 1.0 forces rejection because current ATR
+        # is never below 100% of its own rolling average.
+        cfg = StrategyConfig(**{**_base_cfg().__dict__, "max_atr_avg_ratio": 0.01})
+        signal = evaluate_signal(df, df.copy(), cfg)
+        self.assertIsNone(signal)
+
+    def test_signal_fields_present(self) -> None:
+        """A valid signal dict must include the canonical output fields."""
+        df = _build_candidate_dataframe()
+        signal = evaluate_signal(df, df.copy(), _base_cfg())
+        self.assertIsNotNone(signal)
+        for field in ("side", "price", "stop_price", "tp_price", "risk_per_unit",
+                      "rr_target", "atr", "score", "htf_bias", "strategy",
+                      "confirm_m15", "breakout_time"):
+            self.assertIn(field, signal)
+
+    def test_rr_target_reflected_in_tp(self) -> None:
+        """tp_price must equal price + risk_per_unit * rr_target."""
+        df = _build_candidate_dataframe()
+        signal = evaluate_signal(df, df.copy(), _base_cfg())
+        self.assertIsNotNone(signal)
+        expected_tp = signal["price"] + signal["risk_per_unit"] * signal["rr_target"]
+        self.assertAlmostEqual(signal["tp_price"], expected_tp, places=8)
 
 
 if __name__ == "__main__":

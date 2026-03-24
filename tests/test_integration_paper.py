@@ -10,6 +10,8 @@ import re
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from config import Settings
 from execution import FuturesExecutor
 from risk import RiskManager
@@ -29,6 +31,7 @@ class _CapturingHandler(logging.Handler):
         self.records.append(self.format(record))
 
 
+@pytest.mark.integration
 class PaperTradingIntegrationTests(unittest.TestCase):
     """Integration tests for paper trading entry flow."""
 
