@@ -43,6 +43,9 @@ Set at least:
 For paper mode:
 - `USE_PAPER_TRADING=true`
 - optional `PAPER_START_BALANCE`
+- `ENABLE_OPERATIONAL_KILL_SWITCHES=false` (default; keeps entry behavior unchanged)
+- `ENABLE_OPERATIONAL_ALERTS=false` (default; no extra Telegram operational alerts)
+- `KILL_SWITCH_MAX_API_ERRORS=0` (0 disables API degradation suspension rule)
 
 ## 3. Run bot
 ```bash
@@ -53,6 +56,15 @@ Logs:
 - Console runtime logs
 - `logs/trades.log`
 - `logs/risk_state.json` — persisted risk state, reloaded on restart
+- `logs/ops_status.json` - operational snapshot (JSON)
+- `logs/ops_summary.md` - operational summary (markdown)
+- `logs/ops_state.json` - persisted operational counters
+
+Operational snapshot includes:
+- health state (`healthy/degraded/paused`)
+- scheduler/polling status
+- metrics (`signals_detected`, `signals_rejected`, `entries_attempted`, etc.)
+- recent signals/entries/exits/errors with traceability IDs
 
 ## 4. Run backtest
 ```bash
@@ -79,7 +91,7 @@ python -m pytest tests/ \
   --cov-report=term-missing
 ```
 
-All 31 tests run without a Binance API key. `pyproject.toml` adds the repo root to `sys.path`
+All tests run without a Binance API key. `pyproject.toml` adds the repo root to `sys.path`
 automatically via `pythonpath = ["."]`.
 
 ## 6. Common checks
@@ -87,3 +99,4 @@ automatically via `pythonpath = ["."]`.
 - Scheduler health: heartbeat updates `logs/.alive`
 - Symbol universe: top **300** USDT perpetual symbols by 24h quote volume (hardcoded;
   `USE_TOP_VOLUME_SYMBOLS`, `EXTRA_SYMBOLS`, and `SYMBOLS` can filter/extend the set)
+- Operational health: inspect `logs/ops_summary.md` for healthy/degraded/paused status

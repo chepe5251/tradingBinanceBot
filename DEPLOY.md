@@ -48,6 +48,15 @@ INFO | Heartbeat: bot alive | polls=... scheduler=True
 Container healthcheck is based on `logs/.alive` (updated every `LOG_HEARTBEAT_SEC` seconds).
 
 Risk state is persisted to `logs/risk_state.json` and reloaded automatically on restart.
+Operational status is written to:
+- `logs/ops_status.json`
+- `logs/ops_summary.md`
+- `logs/ops_state.json` (saved on clean shutdown)
+
+`ops_status.json` includes metrics (`signals_detected`, `signals_rejected`,
+`entries_attempted`, `entries_executed`, `entries_failed`, `protection_failures`,
+`order_failures`, `orphan_recoveries`, `heartbeat_count`, `polling_cycles`) plus
+recent signals/entries/exits/errors and global health (`healthy/paused/degraded`).
 
 ### Validating `.env` without exposing secrets
 Check the `Startup |` log line immediately after launch. It shows mode, leverage, sizing, max
@@ -59,3 +68,6 @@ correctly, without echoing any API keys or secrets.
 - Use API key IP whitelist.
 - Keep `MAX_POSITIONS` conservative until validated in your environment.
 - `ENABLE_LOSS_SCALING=false` by default — do not enable without backtesting.
+- `ENABLE_OPERATIONAL_KILL_SWITCHES=false` by default (no entry gating changes unless enabled).
+- `KILL_SWITCH_MAX_API_ERRORS=0` by default (no API degradation suspension unless configured).
+- `ENABLE_OPERATIONAL_ALERTS=false` by default (avoid Telegram operational noise unless needed).

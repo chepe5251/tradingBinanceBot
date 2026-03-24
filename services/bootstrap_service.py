@@ -16,6 +16,7 @@ from config import Settings
 from data_stream import MarketDataStream
 from execution import FuturesExecutor
 from risk import RiskManager
+from services.operational_service import OperationalService
 from services.position_service import (
     PositionCache,
     cleanup_open_orders,
@@ -55,6 +56,7 @@ class RuntimeContext:
     get_executor: Callable[[str], FuturesExecutor]
     evaluation_intervals: list[str]
     context_map: dict[str, str]
+    operations: OperationalService
 
 
 def setup_logging() -> tuple[logging.Logger, logging.Logger]:
@@ -248,6 +250,8 @@ def _build_risk_manager(settings: Settings) -> RiskManager:
 def bootstrap_runtime(settings: Settings, api_key: str, api_secret: str) -> RuntimeContext:
     """Create runtime clients/services while preserving current bot behavior."""
     logger, trades_logger = setup_logging()
+    operations = OperationalService(settings=settings, logger=logger)
+    operations.load_state(settings.ops_state_json_path)
 
     trade_client = configure_client(api_key, api_secret, settings.use_testnet)
     data_client = configure_client("", "", settings.data_use_testnet)
@@ -284,6 +288,7 @@ def bootstrap_runtime(settings: Settings, api_key: str, api_secret: str) -> Runt
     risk.load("logs/risk_state.json")
 
     mode = "PAPER" if settings.use_paper_trading else ("TESTNET" if settings.use_testnet else "LIVE")
+    operations.set_runtime_mode(mode)
     logger.info(
         "Startup | mode=%s leverage=%dx sizing=%s pct=%.0f%% "
         "max_pos=%d symbols=%d intervals=%s hold=%d candles",
@@ -339,4 +344,5 @@ def bootstrap_runtime(settings: Settings, api_key: str, api_secret: str) -> Runt
         get_executor=get_executor,
         evaluation_intervals=evaluation_intervals,
         context_map=context_map,
+        operations=operations,
     )

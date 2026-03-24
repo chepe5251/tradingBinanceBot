@@ -74,6 +74,7 @@ class MarketDataStream:
         self._last_closed_ts: Optional[int] = None
         self._last_closed_wall: Optional[float] = None
         self._event_count: int = 0
+        self._last_poll_duration_sec: float = 0.0
         self._stop_event = threading.Event()
         self._scheduler_thread: Optional[threading.Thread] = None
 
@@ -195,7 +196,9 @@ class MarketDataStream:
 
             logger.info("Scheduler: polling %d symbols × %d intervals via REST",
                         len(self.symbols), len(self._candles))
+            poll_started = time.perf_counter()
             self._refresh_all()
+            self._last_poll_duration_sec = max(0.0, time.perf_counter() - poll_started)
 
             self._event_count += 1
             self._last_closed_ts = int(time.time() * 1000)
@@ -258,6 +261,7 @@ class MarketDataStream:
             "last_closed_ts": self._last_closed_ts,
             "last_closed_wall": self._last_closed_wall,
             "next_close_in_sec": round(next_close_sec, 1),
+            "last_poll_duration_sec": round(self._last_poll_duration_sec, 4),
             "scheduler_alive": (
                 self._scheduler_thread is not None and self._scheduler_thread.is_alive()
             ),

@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
@@ -27,6 +28,9 @@ from sizing import (
 
 RECOVERABLE_ERRORS = (BinanceAPIException, BinanceRequestException, OSError, ValueError, TypeError)
 
+if TYPE_CHECKING:
+    from services.operational_service import OperationalService
+
 
 class EntryService:
     """Orchestrates signal-to-entry execution for scheduler callbacks."""
@@ -44,6 +48,7 @@ class EntryService:
         logger: logging.Logger,
         trades_logger: logging.Logger,
         telegram: TelegramService,
+        operations: "OperationalService | None" = None,
     ) -> None:
         self.settings = settings
         self.stream = stream
@@ -56,6 +61,7 @@ class EntryService:
         self.logger = logger
         self.trades_logger = trades_logger
         self.telegram = telegram
+        self.operations = operations
         self.sizer = PositionSizer(settings.sizing_mode)
 
         self._entry_lock = threading.Lock()
@@ -70,6 +76,31 @@ class EntryService:
             self._on_close(interval)
 
         return _callback
+
+    def _ops_call(self, method: str, **kwargs) -> None:
+        """Invoke optional operational hooks without affecting trading flow."""
+        if self.operations is None:
+            return
+        try:
+            getattr(self.operations, method)(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            # Operational telemetry must never block the trading flow.
+            self.logger.debug("ops_hook_failed method=%s err=%s", method, exc)
+
+    def _mark_entry_failed(
+        self,
+        symbol: str,
+        stage: str,
+        reason: str,
+        trace_id: str = "",
+    ) -> None:
+        self._ops_call(
+            "record_entry_failed",
+            symbol=symbol,
+            stage=stage,
+            reason=reason,
+            trace_id=trace_id,
+        )
 
     def _on_close(self, interval: str) -> None:
         interval_state = self._interval_states[interval]
@@ -92,6 +123,13 @@ class EntryService:
             positions_snapshot = self.position_cache.get()
         except RECOVERABLE_ERRORS as exc:
             self.logger.warning("entry_gate_positions_failed interval=%s err=%s", interval, exc)
+            self._ops_call(
+                "record_error",
+                stage="entry_gate_positions",
+                err=exc,
+                recoverable=True,
+                api_related=True,
+            )
             return
 
         active_positions, symbols_with_positions = count_active_positions(positions_snapshot)
@@ -105,10 +143,24 @@ class EntryService:
             context_interval=context_interval,
             settings=self.settings,
             trades_logger=self.trades_logger,
+            operations=self.operations,
         )
         if not valid_signals:
             return
 
+        for candidate in valid_signals:
+            trace_id = str(candidate.payload.get("trace_id") or f"{candidate.symbol}-{interval}-{close_ms}")
+            candidate.payload["trace_id"] = trace_id
+            self._ops_call(
+                "record_signal_detected",
+                symbol=candidate.symbol,
+                interval=interval,
+                side=str(candidate.payload.get("side") or ""),
+                score=float(candidate.score),
+                trace_id=trace_id,
+            )
+
+        pre_filter_candidates = list(valid_signals)
         valid_signals = [
             candidate for candidate in valid_signals if candidate.symbol not in symbols_with_positions
         ]
@@ -118,6 +170,14 @@ class EntryService:
                 interval,
                 active_positions,
             )
+            for candidate in pre_filter_candidates:
+                self._ops_call(
+                    "record_signal_discarded",
+                    reason="per_symbol_limit",
+                    symbol=candidate.symbol,
+                    interval=interval,
+                    trace_id=str(candidate.payload.get("trace_id") or ""),
+                )
             return
 
         execution_allowed = can_trade_now and not has_open_position
@@ -143,8 +203,25 @@ class EntryService:
                     )
             except RECOVERABLE_ERRORS as exc:
                 self.logger.warning("position_gate_failed interval=%s err=%s", interval, exc)
+                self._ops_call(
+                    "record_error",
+                    stage="position_gate",
+                    err=exc,
+                    recoverable=True,
+                    api_related=True,
+                )
                 execution_allowed = False
                 block_reason = "BLOQUEADA: ERROR VERIFICANDO POSICION"
+
+        ops_allows_entries = True
+        try:
+            ops_allows_entries = self.operations.can_open_new_entries() if self.operations else True
+        except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
+            self.logger.debug("ops_gate_failed interval=%s err=%s", interval, exc)
+            ops_allows_entries = True
+        if execution_allowed and not ops_allows_entries:
+            execution_allowed = False
+            block_reason = "BLOQUEADA POR SUSPENSION OPERATIVA"
 
         self._broadcast_signal_alerts(valid_signals, interval)
 
@@ -158,6 +235,13 @@ class EntryService:
                 interval,
                 block_reason or "BLOQUEADA",
                 len(valid_signals),
+            )
+            self._ops_call(
+                "record_signal_discarded",
+                reason=block_reason or "blocked",
+                symbol=best_candidate.symbol,
+                interval=interval,
+                trace_id=str(best_candidate.payload.get("trace_id") or ""),
             )
             return
 
@@ -179,6 +263,7 @@ class EntryService:
         for candidate in candidates:
             signal = candidate.payload
             side = signal["side"]
+            trace_id = str(signal.get("trace_id") or "")
             entry = self._entry_price_with_offset(side, float(signal["price"]))
             atr_value = float(signal.get("atr") or 0.0)
             signal_risk = float(signal.get("risk_per_unit") or 0.0)
@@ -210,6 +295,20 @@ class EntryService:
                 volatility="Normal",
                 structure=signal.get("strategy", "ob_bos").replace("_", " ").title(),
             )
+            self.trades_logger.info(
+                "signal_alert %s tf=%s side=%s trace=%s",
+                candidate.symbol,
+                interval,
+                side,
+                trace_id,
+            )
+            self._ops_call(
+                "record_signal_alerted",
+                symbol=candidate.symbol,
+                interval=interval,
+                side=side,
+                trace_id=trace_id,
+            )
             threading.Thread(target=self.telegram.send, args=(msg,), daemon=True).start()
 
     def _entry_price_with_offset(self, side: str, market_price: float) -> float:
@@ -226,6 +325,15 @@ class EntryService:
         symbol = candidate.symbol
         signal = candidate.payload
         side = signal["side"]
+        trace_id = str(signal.get("trace_id") or f"{symbol}-{interval}-{int(time.time() * 1000)}")
+        signal["trace_id"] = trace_id
+        self._ops_call(
+            "record_entry_attempt",
+            symbol=symbol,
+            side=side,
+            interval=interval,
+            trace_id=trace_id,
+        )
         entry_price = self._entry_price_with_offset(side, float(signal["price"]))
         signal_risk = float(signal.get("risk_per_unit") or 0.0)
 
@@ -234,6 +342,7 @@ class EntryService:
             atr_value = atr_last(self.stream.get_dataframe(symbol, interval), self.settings.atr_period)
         if atr_value <= 0:
             self.trades_logger.info("skip %s reason=atr_invalid", symbol)
+            self._mark_entry_failed(symbol, "pre_entry", "atr_invalid", trace_id=trace_id)
             return False
 
         signal_rr = max(float(signal.get("rr_target") or 0.0), 1.8)
@@ -254,6 +363,16 @@ class EntryService:
         except RECOVERABLE_ERRORS as exc:
             self.logger.warning("balance_fetch_failed symbol=%s err=%s", symbol, exc)
             self.trades_logger.info("skip %s reason=balance_fetch_failed", symbol)
+            self._ops_call(
+                "record_error",
+                stage="balance_fetch",
+                err=exc,
+                symbol=symbol,
+                recoverable=True,
+                api_related=True,
+                trace_id=trace_id,
+            )
+            self._mark_entry_failed(symbol, "pre_entry", "balance_fetch_failed", trace_id=trace_id)
             return False
 
         executor: FuturesExecutor = self.get_executor(symbol)
@@ -263,6 +382,7 @@ class EntryService:
         entry_df = self.stream.get_dataframe(symbol, interval)
         if entry_df.empty or len(entry_df) < 12:
             self.trades_logger.info("skip %s reason=entry_df_insufficient", symbol)
+            self._mark_entry_failed(symbol, "pre_entry", "entry_df_insufficient", trace_id=trace_id)
             return False
 
         swing_window = entry_df.iloc[-10:-1]
@@ -296,11 +416,13 @@ class EntryService:
                 self.settings.risk_per_trade_pct,
                 available_balance,
             )
+            self._mark_entry_failed(symbol, "sizing", "margin_to_use_invalid", trace_id=trace_id)
             return False
 
         qty_by_margin = executor.calc_qty(margin_to_use, entry_price)
         if qty_by_margin <= 0:
             self.trades_logger.info("skip %s reason=qty_by_margin_invalid", symbol)
+            self._mark_entry_failed(symbol, "sizing", "qty_by_margin_invalid", trace_id=trace_id)
             return False
         qty_l1 = executor.round_qty(qty_by_margin)
 
@@ -325,6 +447,12 @@ class EntryService:
                         sl_required,
                         entry_price,
                     )
+                    self._mark_entry_failed(
+                        symbol,
+                        "sl_validation",
+                        "sl_inside_liquidation_zone",
+                        trace_id=trace_id,
+                    )
                     return False
             else:
                 sl_required = entry_price + min_sl_distance_for_rebuy
@@ -336,6 +464,12 @@ class EntryService:
                         sl_common,
                         sl_required,
                         entry_price,
+                    )
+                    self._mark_entry_failed(
+                        symbol,
+                        "sl_validation",
+                        "sl_inside_liquidation_zone",
+                        trace_id=trace_id,
                     )
                     return False
 
@@ -350,10 +484,22 @@ class EntryService:
                 min_qty,
                 min_notional,
             )
+            self._mark_entry_failed(symbol, "validation", "entry_notional_invalid", trace_id=trace_id)
             return False
 
+        self.trades_logger.info(
+            "entry_attempt %s tf=%s side=%s qty=%.6f entry=%.6f margin=%.4f trace=%s",
+            symbol,
+            interval,
+            side,
+            qty_l1,
+            entry_price,
+            margin_to_use,
+            trace_id,
+        )
         if not self._entry_lock.acquire(blocking=False):
             self.trades_logger.info("signal_only tf=%s reason=entry_lock_busy sym=%s", interval, symbol)
+            self._mark_entry_failed(symbol, "entry_lock", "entry_lock_busy", trace_id=trace_id)
             return False
 
         filled_qty = 0.0
@@ -361,14 +507,40 @@ class EntryService:
         exec_type = "UNKNOWN"
         try:
             if self._is_position_gate_blocked(symbol):
+                self._mark_entry_failed(
+                    symbol,
+                    "position_gate_recheck",
+                    "blocked",
+                    trace_id=trace_id,
+                )
                 return False
 
             try:
                 self.trade_client.futures_cancel_all_open_orders(symbol=symbol)
             except RECOVERABLE_ERRORS as exc:
                 self.logger.warning("pre_entry_cleanup_failed symbol=%s err=%s", symbol, exc)
+                self._ops_call(
+                    "record_error",
+                    stage="pre_entry_cleanup",
+                    err=exc,
+                    symbol=symbol,
+                    recoverable=True,
+                    api_related=True,
+                    trace_id=trace_id,
+                )
 
             try:
+                self._ops_call(
+                    "record_event",
+                    kind="order_submit",
+                    detail={
+                        "symbol": symbol,
+                        "side": side,
+                        "qty": qty_l1,
+                        "entry_price": entry_price,
+                    },
+                    trace_id=trace_id,
+                )
                 filled_qty, avg_price, exec_type = self._place_entry(
                     executor=executor,
                     side=side,
@@ -384,20 +556,32 @@ class EntryService:
                     entry_price,
                     exc,
                 )
+                self._ops_call(
+                    "record_error",
+                    stage="order_placement",
+                    err=exc,
+                    symbol=symbol,
+                    recoverable=True,
+                    api_related=True,
+                    trace_id=trace_id,
+                )
                 self.trades_logger.info(
-                    "error %s stage=entry side=%s qty=%.6f entry=%.6f msg=%s",
+                    "error %s stage=entry side=%s qty=%.6f entry=%.6f trace=%s msg=%s",
                     symbol,
                     side,
                     qty_l1,
                     entry_price,
+                    trace_id,
                     exc,
                 )
+                self._mark_entry_failed(symbol, "order_placement", "exception", trace_id=trace_id)
                 return False
         finally:
             self._entry_lock.release()
 
         if filled_qty <= 0:
             self.trades_logger.info("skip %s reason=entry_not_filled", symbol)
+            self._mark_entry_failed(symbol, "order_fill", "entry_not_filled", trace_id=trace_id)
             return False
 
         self.position_cache.invalidate()
@@ -405,6 +589,7 @@ class EntryService:
         risk_distance = abs(entry_price - sl_common)
         if risk_distance <= 0:
             self.trades_logger.info("skip %s reason=post_fill_risk_invalid", symbol)
+            self._mark_entry_failed(symbol, "post_fill", "post_fill_risk_invalid", trace_id=trace_id)
             return False
 
         strategy_risk = float(signal.get("risk_per_unit") or 0.0)
@@ -420,6 +605,27 @@ class EntryService:
             max((risk_distance * 0.3) / entry_price, 0.004) if entry_price > 0 else 0.004
         )
         filled_qty = executor.round_qty(filled_qty)
+        self._ops_call(
+            "record_entry_executed",
+            symbol=symbol,
+            side=side,
+            interval=interval,
+            qty=filled_qty,
+            entry=entry_price,
+            margin=margin_to_use,
+            exec_type=exec_type,
+            trace_id=trace_id,
+        )
+        self._ops_call("record_success", stage="entry_execution")
+        self.trades_logger.info(
+            "entry_executed %s tf=%s side=%s qty=%.6f entry=%.6f trace=%s",
+            symbol,
+            interval,
+            side,
+            filled_qty,
+            entry_price,
+            trace_id,
+        )
 
         trade_state = {
             "entry_price": entry_price,
@@ -431,6 +637,7 @@ class EntryService:
             "anchor_entry_price": entry_price,
             "anchor_risk_distance": risk_distance,
             "tp_risk_cap": tp_risk_cap,
+            "trace_id": trace_id,
         }
         level_state = {
             "loss_l1_done": False,
@@ -481,6 +688,14 @@ class EntryService:
             exec_type=exec_type,
             margin_to_use=margin_to_use,
             max_hold_candles=self.settings.max_hold_candles,
+            operations=self.operations,
+            trace_id=trace_id,
+        )
+        self._ops_call(
+            "record_event",
+            kind="monitor_started",
+            detail={"symbol": symbol, "interval": interval, "side": side},
+            trace_id=trace_id,
         )
         threading.Thread(target=monitor.run, daemon=True).start()
         return True
@@ -490,6 +705,14 @@ class EntryService:
             positions = self.trade_client.futures_position_information()
         except RECOVERABLE_ERRORS as exc:
             self.logger.warning("entry_recheck_failed symbol=%s err=%s", symbol, exc)
+            self._ops_call(
+                "record_error",
+                stage="entry_recheck",
+                err=exc,
+                symbol=symbol,
+                recoverable=True,
+                api_related=True,
+            )
             return True
 
         recheck_count, recheck_symbols = count_active_positions(positions)

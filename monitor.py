@@ -45,6 +45,7 @@ MONITOR_ERRORS = (
 if TYPE_CHECKING:
     from config import Settings
     from data_stream import MarketDataStream
+    from services.operational_service import OperationalService
 
 
 class PositionMonitor:
@@ -82,6 +83,8 @@ class PositionMonitor:
         exec_type: str = "MARKET",
         margin_to_use: float = 0.0,
         max_hold_candles: int = 50,
+        operations: "OperationalService | None" = None,
+        trace_id: str = "",
     ) -> None:
         self.executor = executor
         self.stream = stream
@@ -109,6 +112,17 @@ class PositionMonitor:
         self.exec_type = exec_type
         self.margin_to_use = margin_to_use
         self.max_hold_candles = max_hold_candles
+        self.operations = operations
+        self.trace_id = trace_id
+
+    def _ops_call(self, method: str, **kwargs) -> None:
+        if self.operations is None:
+            return
+        try:
+            getattr(self.operations, method)(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            # Operational telemetry must not interfere with live monitoring.
+            self.logger.debug("ops_hook_failed method=%s err=%s", method, exc)
 
     # ── Internal callbacks ───────────────────────────────────────────────────
 
@@ -392,6 +406,13 @@ class PositionMonitor:
                     self.trades_logger.info(
                         "critical %s reason=position_closed_no_protection", self.symbol
                     )
+                    self._ops_call(
+                        "record_protection_result",
+                        symbol=self.symbol,
+                        ok=False,
+                        stage="position_closed_no_protection",
+                        trace_id=self.trace_id,
+                    )
                     return
             try:
                 existing_tp, existing_sl = self.executor.get_protection_refs(
@@ -399,6 +420,13 @@ class PositionMonitor:
                 )
                 if existing_tp and existing_sl:
                     tp_ref, sl_ref = existing_tp, existing_sl
+                    self._ops_call(
+                        "record_protection_result",
+                        symbol=self.symbol,
+                        ok=True,
+                        stage="reused_existing",
+                        trace_id=self.trace_id,
+                    )
                     break
                 tp_ref, sl_ref = self.executor.place_tp_sl(
                     self.side,
@@ -408,15 +436,47 @@ class PositionMonitor:
                     client_id_prefix=self.client_id_prefix,
                 )
                 if tp_ref and sl_ref:
+                    self._ops_call(
+                        "record_protection_result",
+                        symbol=self.symbol,
+                        ok=True,
+                        stage="placed",
+                        trace_id=self.trace_id,
+                    )
                     break
             except MONITOR_ERRORS as exc:
                 self.logger.error("TP/SL placement failed %s: %s", self.symbol, exc)
                 self.trades_logger.info("error %s stage=tp_sl msg=%s", self.symbol, exc)
+                self._ops_call(
+                    "record_error",
+                    stage="tp_sl_placement",
+                    err=exc,
+                    symbol=self.symbol,
+                    recoverable=True,
+                    api_related=True,
+                    trace_id=self.trace_id,
+                )
+                self._ops_call(
+                    "record_protection_result",
+                    symbol=self.symbol,
+                    ok=False,
+                    stage="placement_exception",
+                    trace_id=self.trace_id,
+                )
 
             attempts += 1
             if attempts >= 10 and not emergency:
                 emergency = True
                 self.trades_logger.info("critical %s reason=tp_sl_emergency", self.symbol)
+                self._ops_call(
+                    "record_error",
+                    stage="tp_sl_emergency",
+                    err="tp_sl_emergency",
+                    symbol=self.symbol,
+                    recoverable=False,
+                    api_related=True,
+                    trace_id=self.trace_id,
+                )
             time.sleep(2 if emergency else 1)
 
         # ── log confirmed entry ───────────────────────────────────────────
@@ -424,7 +484,7 @@ class PositionMonitor:
         self.trades_logger.info(
             "ENTRY %s tf=%s side=%s entry=%.4f sl_strategy=%.4f sl_swing=%.4f "
             "sl_atr=%.4f sl_final=%.4f tp=%.4f risk=%.4f rr_real=%.3f "
-            "atr=%.4f score=%.2f exec=%s qty=%.6f margin=%.2f",
+            "atr=%.4f score=%.2f exec=%s qty=%.6f margin=%.2f trace=%s",
             self.symbol, self.interval, self.side,
             float(trade_state["entry_price"]),
             float(self.signal.get("stop_price", 0)),
@@ -439,6 +499,7 @@ class PositionMonitor:
             self.exec_type,
             float(trade_state["qty"]),
             self.margin_to_use,
+            self.trace_id or "",
         )
 
         # ── OCO monitor loop (breakeven → trailing → review → exit) ──────
@@ -475,9 +536,40 @@ class PositionMonitor:
                 pnl = -pnl
             self.risk_updater(pnl, datetime.now(timezone.utc))
             self.pos_cache_invalidate()
-            self.trades_logger.info("exit %s result=%s pnl=%.4f", self.symbol, result, pnl)
+            equity_after = float(self.risk.snapshot().equity)
+            self._ops_call(
+                "record_trade_closed",
+                symbol=self.symbol,
+                result=result,
+                pnl=pnl,
+                paper=bool(self.executor.paper),
+                equity_after=equity_after,
+                trace_id=self.trace_id,
+            )
+            self.trades_logger.info(
+                "exit %s result=%s pnl=%.4f trace=%s",
+                self.symbol,
+                result,
+                pnl,
+                self.trace_id or "",
+            )
             return
-        self.trades_logger.info("exit %s result=%s pnl=0.0", self.symbol, result)
+        equity_after = float(self.risk.snapshot().equity)
+        self._ops_call(
+            "record_trade_closed",
+            symbol=self.symbol,
+            result=result,
+            pnl=0.0,
+            paper=bool(self.executor.paper),
+            equity_after=equity_after,
+            trace_id=self.trace_id,
+        )
+        self.trades_logger.info(
+            "exit %s result=%s pnl=0.0 trace=%s",
+            self.symbol,
+            result,
+            self.trace_id or "",
+        )
 
     @staticmethod
     def resume_orphan(
@@ -492,6 +584,7 @@ class PositionMonitor:
         risk_updater: Callable[[float, datetime], None],
         logger: logging.Logger,
         trades_logger: logging.Logger,
+        operations: "OperationalService | None" = None,
     ) -> None:
         """Recover a single orphaned position and start its daemon monitor thread.
 
@@ -499,9 +592,25 @@ class PositionMonitor:
         (falling back to ATR estimates), then starts `_orphan_monitor` as a
         daemon thread so the position is protected for the rest of its life.
         """
+        def _ops_call(method: str, **kwargs) -> None:
+            if operations is None:
+                return
+            try:
+                getattr(operations, method)(**kwargs)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("ops_orphan_hook_failed method=%s err=%s", method, exc)
+
         symbol = orphan.get("symbol", "")
+        orphan_trace_id = f"orphan-{symbol or 'UNKNOWN'}-{int(time.time() * 1000)}"
         if not symbol or symbol not in set(symbols):
             logger.warning("Orphan recovery: symbol %s not in universe, skipping.", symbol)
+            _ops_call(
+                "record_orphan_status",
+                symbol=symbol or "UNKNOWN",
+                status="unrecoverable",
+                detail="symbol_not_in_universe",
+                trace_id=orphan_trace_id,
+            )
             return
 
         try:
@@ -510,17 +619,38 @@ class PositionMonitor:
             side = "BUY" if float(orphan.get("positionAmt", 0)) > 0 else "SELL"
         except (TypeError, ValueError) as exc:
             logger.warning("Orphan recovery: could not parse position data: %s", exc)
+            _ops_call(
+                "record_orphan_status",
+                symbol=symbol,
+                status="unrecoverable",
+                detail=f"parse_failed:{exc}",
+                trace_id=orphan_trace_id,
+            )
             return
 
         if qty <= 0 or entry_price <= 0:
             logger.warning(
                 "Orphan recovery: invalid qty=%.4f entry=%.4f, skipping.", qty, entry_price,
             )
+            _ops_call(
+                "record_orphan_status",
+                symbol=symbol,
+                status="unrecoverable",
+                detail="invalid_qty_or_entry",
+                trace_id=orphan_trace_id,
+            )
             return
 
         logger.info(
             "Orphan recovery: resuming %s side=%s qty=%.4f entry=%.4f",
             symbol, side, qty, entry_price,
+        )
+        _ops_call(
+            "record_orphan_status",
+            symbol=symbol,
+            status="detected",
+            detail="resuming",
+            trace_id=orphan_trace_id,
         )
 
         # Prefer existing TP/SL orders; fall back to ATR-based estimates.
@@ -540,6 +670,15 @@ class PositionMonitor:
                     tp_price = sp
         except MONITOR_ERRORS as exc:
             logger.warning("Orphan recovery: could not fetch open orders: %s", exc)
+            _ops_call(
+                "record_error",
+                stage="orphan_open_orders",
+                err=exc,
+                symbol=symbol,
+                recoverable=True,
+                api_related=True,
+                trace_id=orphan_trace_id,
+            )
 
         df_orphan = stream.get_dataframe(symbol, settings.main_interval)
         atr_orphan = atr_last(df_orphan, settings.atr_period) if not df_orphan.empty else 0.0
@@ -603,6 +742,13 @@ class PositionMonitor:
                         time.sleep(0.5)
                         continue
                     trades_logger.info("orphan %s reason=position_gone", symbol)
+                    _ops_call(
+                        "record_orphan_status",
+                        symbol=symbol,
+                        status="unrecoverable",
+                        detail="position_gone_before_protection",
+                        trace_id=orphan_trace_id,
+                    )
                     return
 
                 try:
@@ -611,6 +757,13 @@ class PositionMonitor:
                     )
                     if existing_tp and existing_sl:
                         tp_ref, sl_ref = existing_tp, existing_sl
+                        _ops_call(
+                            "record_protection_result",
+                            symbol=symbol,
+                            ok=True,
+                            stage="orphan_reused_existing",
+                            trace_id=orphan_trace_id,
+                        )
                         break
                     tp_ref, sl_ref = executor.place_tp_sl(
                         side,
@@ -620,20 +773,58 @@ class PositionMonitor:
                         client_id_prefix=client_id_prefix,
                     )
                     if tp_ref and sl_ref:
+                        _ops_call(
+                            "record_protection_result",
+                            symbol=symbol,
+                            ok=True,
+                            stage="orphan_placed",
+                            trace_id=orphan_trace_id,
+                        )
                         break
                 except MONITOR_ERRORS as exc:
                     logger.error("Orphan TP/SL placement failed %s: %s", symbol, exc)
+                    _ops_call(
+                        "record_error",
+                        stage="orphan_tp_sl_placement",
+                        err=exc,
+                        symbol=symbol,
+                        recoverable=True,
+                        api_related=True,
+                        trace_id=orphan_trace_id,
+                    )
+                    _ops_call(
+                        "record_protection_result",
+                        symbol=symbol,
+                        ok=False,
+                        stage="orphan_placement_exception",
+                        trace_id=orphan_trace_id,
+                    )
 
                 attempts += 1
                 time.sleep(2)
                 if attempts >= 15:
                     trades_logger.info("critical %s reason=orphan_tp_sl_fail", symbol)
+                    _ops_call(
+                        "record_orphan_status",
+                        symbol=symbol,
+                        status="unrecoverable",
+                        detail="orphan_tp_sl_fail",
+                        trace_id=orphan_trace_id,
+                    )
                     return
 
             trades_logger.info(
-                "orphan_resumed %s side=%s price=%.4f qty=%.6f tp=%.4f sl=%.4f",
+                "orphan_resumed %s side=%s price=%.4f qty=%.6f tp=%.4f sl=%.4f trace=%s",
                 symbol, side, entry_price, qty_rounded,
                 float(orphan_trade_state["tp"]), float(orphan_trade_state["sl"]),
+                orphan_trace_id,
+            )
+            _ops_call(
+                "record_orphan_status",
+                symbol=symbol,
+                status="resumed",
+                detail="monitor_started",
+                trace_id=orphan_trace_id,
             )
 
             result, exit_price_val = executor.monitor_oco(
@@ -664,7 +855,22 @@ class PositionMonitor:
                 pnl = -pnl
             risk_updater(pnl, datetime.now(timezone.utc))
             pos_cache_invalidate()
-            trades_logger.info("orphan_exit %s result=%s pnl=%.4f", symbol, result, pnl)
+            trades_logger.info(
+                "orphan_exit %s result=%s pnl=%.4f trace=%s",
+                symbol,
+                result,
+                pnl,
+                orphan_trace_id,
+            )
+            _ops_call(
+                "record_trade_closed",
+                symbol=symbol,
+                result=f"orphan:{result}",
+                pnl=pnl,
+                paper=bool(executor.paper),
+                equity_after=float(risk.snapshot().equity),
+                trace_id=orphan_trace_id,
+            )
 
         threading.Thread(
             target=_orphan_monitor, daemon=True, name=f"orphan-{symbol}"

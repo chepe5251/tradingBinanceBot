@@ -55,6 +55,7 @@ def evaluate_interval_signals(
     context_interval: str | None,
     settings: Settings,
     trades_logger,
+    operations=None,
 ) -> list[SignalCandidate]:
     """Evaluate all symbols for one timeframe and return sorted candidates."""
     valid_signals: list[SignalCandidate] = []
@@ -75,6 +76,20 @@ def evaluate_interval_signals(
             continue
 
         if interval in settings.block_sell_on_intervals and signal.get("side") == "SELL":
+            trades_logger.info(
+                "skip %s reason=block_sell_on_interval tf=%s",
+                symbol,
+                interval,
+            )
+            if operations is not None:
+                try:
+                    operations.record_signal_discarded(
+                        reason="block_sell_on_interval",
+                        symbol=symbol,
+                        interval=interval,
+                    )
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    pass
             continue
 
         signal["timeframe"] = interval.upper()

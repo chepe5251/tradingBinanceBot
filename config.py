@@ -106,6 +106,25 @@ class Settings:
     log_candle_updates: bool = False
     log_candle_every_sec: int = 60
 
+    # Operational observability/safety (optional, disabled by default)
+    enable_operational_kill_switches: bool = False
+    kill_switch_max_consecutive_errors: int = 0
+    kill_switch_max_api_errors: int = 0
+    kill_switch_max_order_failures: int = 0
+    kill_switch_max_protection_failures: int = 0
+    kill_switch_max_scheduler_idle_sec: int = 0
+    kill_switch_pause_on_orphan_unrecoverable: bool = False
+    operational_suspend_sec: int = 900
+    enable_operational_alerts: bool = False
+    operational_alert_cooldown_sec: int = 300
+    ops_report_interval_sec: int = 60
+    ops_recent_events: int = 25
+    ops_hourly_summary: bool = True
+    ops_daily_summary: bool = True
+    ops_status_json_path: str = "logs/ops_status.json"
+    ops_summary_md_path: str = "logs/ops_summary.md"
+    ops_state_json_path: str = "logs/ops_state.json"
+
 
 def load_env(path: str = ".env") -> None:
     """Populate `os.environ` from a dotenv-style file without overwriting values."""
@@ -220,6 +239,62 @@ def from_env() -> Settings:
     _set_int(settings, "log_heartbeat_sec", "LOG_HEARTBEAT_SEC", minimum=5)
     _set_bool(settings, "log_candle_updates", "LOG_CANDLE_UPDATES")
     _set_int(settings, "log_candle_every_sec", "LOG_CANDLE_EVERY_SEC", minimum=5)
+
+    _set_bool(
+        settings,
+        "enable_operational_kill_switches",
+        "ENABLE_OPERATIONAL_KILL_SWITCHES",
+    )
+    _set_int(
+        settings,
+        "kill_switch_max_consecutive_errors",
+        "KILL_SWITCH_MAX_CONSECUTIVE_ERRORS",
+        minimum=0,
+    )
+    _set_int(
+        settings,
+        "kill_switch_max_api_errors",
+        "KILL_SWITCH_MAX_API_ERRORS",
+        minimum=0,
+    )
+    _set_int(
+        settings,
+        "kill_switch_max_order_failures",
+        "KILL_SWITCH_MAX_ORDER_FAILURES",
+        minimum=0,
+    )
+    _set_int(
+        settings,
+        "kill_switch_max_protection_failures",
+        "KILL_SWITCH_MAX_PROTECTION_FAILURES",
+        minimum=0,
+    )
+    _set_int(
+        settings,
+        "kill_switch_max_scheduler_idle_sec",
+        "KILL_SWITCH_MAX_SCHEDULER_IDLE_SEC",
+        minimum=0,
+    )
+    _set_bool(
+        settings,
+        "kill_switch_pause_on_orphan_unrecoverable",
+        "KILL_SWITCH_PAUSE_ON_ORPHAN_UNRECOVERABLE",
+    )
+    _set_int(settings, "operational_suspend_sec", "OPERATIONAL_SUSPEND_SEC", minimum=0)
+    _set_bool(settings, "enable_operational_alerts", "ENABLE_OPERATIONAL_ALERTS")
+    _set_int(
+        settings,
+        "operational_alert_cooldown_sec",
+        "OPERATIONAL_ALERT_COOLDOWN_SEC",
+        minimum=10,
+    )
+    _set_int(settings, "ops_report_interval_sec", "OPS_REPORT_INTERVAL_SEC", minimum=10)
+    _set_int(settings, "ops_recent_events", "OPS_RECENT_EVENTS", minimum=5)
+    _set_bool(settings, "ops_hourly_summary", "OPS_HOURLY_SUMMARY")
+    _set_bool(settings, "ops_daily_summary", "OPS_DAILY_SUMMARY")
+    _set_str(settings, "ops_status_json_path", "OPS_STATUS_JSON_PATH")
+    _set_str(settings, "ops_summary_md_path", "OPS_SUMMARY_MD_PATH")
+    _set_str(settings, "ops_state_json_path", "OPS_STATE_JSON_PATH")
 
     _set_int(settings, "leverage", "LEVERAGE", minimum=1)
     _set_str(settings, "margin_type", "MARGIN_TYPE")

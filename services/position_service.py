@@ -17,6 +17,7 @@ from risk import RiskManager
 if TYPE_CHECKING:
     from config import Settings
     from data_stream import MarketDataStream
+    from services.operational_service import OperationalService
 
 
 # Binance may return either variant depending on the endpoint and order version
@@ -144,6 +145,7 @@ def resume_orphaned_positions(
     risk_updater: Callable[[float, datetime], None],
     logger: logging.Logger,
     trades_logger: logging.Logger,
+    operations: "OperationalService | None" = None,
 ) -> None:
     """Recover orphaned open positions and attach monitors."""
     try:
@@ -174,4 +176,5 @@ def resume_orphaned_positions(
             risk_updater=risk_updater,
             logger=logger,
             trades_logger=trades_logger,
+            operations=operations,
         )

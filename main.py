@@ -11,7 +11,7 @@ from binance.exceptions import BinanceAPIException, BinanceRequestException
 from config import from_env
 from services.bootstrap_service import bootstrap_runtime
 from services.entry_service import EntryService
-from services.position_service import resume_orphaned_positions
+from services.position_service import count_active_positions, resume_orphaned_positions
 from services.telegram_service import TelegramService
 
 
@@ -42,7 +42,16 @@ def main() -> None:
         logger=runtime.logger,
         trades_logger=runtime.trades_logger,
         telegram=telegram,
+        operations=runtime.operations,
     )
+    try:
+        runtime.operations.bind_telegram(telegram)
+        runtime.operations.record_startup(
+            symbols=len(runtime.symbols),
+            intervals=runtime.evaluation_intervals,
+        )
+    except Exception as exc:  # noqa: BLE001
+        runtime.logger.warning("ops_startup_hook_failed err=%s", exc)
 
     shutdown = threading.Event()
 
@@ -67,12 +76,31 @@ def main() -> None:
                 risk_updater=runtime.risk.update_trade,
                 logger=runtime.logger,
                 trades_logger=runtime.trades_logger,
+                operations=runtime.operations,
             )
         except (BinanceAPIException, BinanceRequestException, OSError, ValueError, TypeError) as exc:
             runtime.logger.warning("orphan_recovery_failed err=%s", exc)
+            try:
+                runtime.operations.record_error(
+                    stage="orphan_recovery",
+                    err=exc,
+                    recoverable=True,
+                    api_related=True,
+                )
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as exc:  # noqa: BLE001
             # Keep broad fallback: orphan recovery should never abort startup.
             runtime.logger.warning("orphan_recovery_failed_unexpected err=%s", exc)
+            try:
+                runtime.operations.record_error(
+                    stage="orphan_recovery",
+                    err=exc,
+                    recoverable=False,
+                    api_related=True,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     callbacks = {
         interval: entry_service.make_on_close(interval) for interval in runtime.evaluation_intervals
@@ -96,6 +124,30 @@ def main() -> None:
             status.get("next_close_in_sec", 0),
             status.get("scheduler_alive"),
         )
+        open_positions = 0
+        if not settings.use_paper_trading:
+            try:
+                positions_snapshot = runtime.position_cache.get()
+                open_positions, _ = count_active_positions(positions_snapshot)
+            except (BinanceAPIException, BinanceRequestException, OSError, ValueError, TypeError) as exc:
+                runtime.logger.warning("heartbeat_position_count_failed err=%s", exc)
+                try:
+                    runtime.operations.record_error(
+                        stage="heartbeat_positions",
+                        err=exc,
+                        recoverable=True,
+                        api_related=True,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            runtime.operations.heartbeat(
+                stream_status=status,
+                risk_state=runtime.risk.snapshot(),
+                open_positions=open_positions,
+            )
+        except Exception as exc:  # noqa: BLE001
+            runtime.logger.warning("ops_heartbeat_failed err=%s", exc)
         try:
             os.makedirs("logs", exist_ok=True)
             with open("logs/.alive", "w", encoding="utf-8") as alive_file:
@@ -105,6 +157,11 @@ def main() -> None:
         last_heartbeat = time.time()
 
     runtime.risk.save("logs/risk_state.json")
+    try:
+        runtime.operations.force_report()
+        runtime.operations.save_state(settings.ops_state_json_path)
+    except Exception as exc:  # noqa: BLE001
+        runtime.logger.warning("ops_shutdown_hook_failed err=%s", exc)
     runtime.logger.info("Shutdown complete.")
     runtime.stream.stop()
 

@@ -21,6 +21,98 @@ Run:
 python main.py
 ```
 
+## Stage 3 Operations (Runtime Hardening)
+
+Stage 3 adds an operational layer for observability and safety without changing
+the default trading behaviour.
+
+Important defaults:
+- `ENABLE_OPERATIONAL_KILL_SWITCHES=false`
+- `ENABLE_OPERATIONAL_ALERTS=false`
+
+With defaults, leverage/sizing/exposure/entry-exit logic remain unchanged.
+
+### Operational Metrics
+
+The bot now tracks operational counters such as:
+- `signals_detected`
+- `signals_rejected`
+- `entries_attempted`
+- `entries_executed`
+- `entries_failed`
+- `protection_failures`
+- `order_failures`
+- `orphan_recoveries`
+- `heartbeat_count`
+- `polling_cycles`
+- `last_signal_time`
+- `last_entry_time`
+- `last_exit_time`
+- `uptime_sec`
+
+### Operational Dashboard/Reports
+
+Generated periodically (default each 60s):
+- `logs/ops_status.json` (machine-readable snapshot)
+- `logs/ops_summary.md` (human-readable summary)
+
+`ops_status.json` includes:
+- mode (`LIVE/PAPER/TESTNET`)
+- health (`healthy/paused/degraded`)
+- scheduler and polling status
+- metrics block (keys above)
+- recent signals/entries/exits
+- recent errors
+- suspension reasons (if any)
+
+State counters are persisted at shutdown in:
+- `logs/ops_state.json`
+
+### Kill Switches and Auto Suspension
+
+A configurable framework can pause **new entries only** while keeping monitors alive.
+Rules include:
+- consecutive errors
+- repeated API degradation (`KILL_SWITCH_MAX_API_ERRORS`)
+- consecutive order failures
+- consecutive protection failures
+- scheduler stale/idle
+- orphan unrecoverable (optional)
+
+Suspensions are time-based (`OPERATIONAL_SUSPEND_SEC`) and reversible.
+
+Example (optional; disabled by default):
+```env
+ENABLE_OPERATIONAL_KILL_SWITCHES=true
+KILL_SWITCH_MAX_CONSECUTIVE_ERRORS=6
+KILL_SWITCH_MAX_ORDER_FAILURES=4
+KILL_SWITCH_MAX_PROTECTION_FAILURES=3
+KILL_SWITCH_MAX_SCHEDULER_IDLE_SEC=1800
+OPERATIONAL_SUSPEND_SEC=900
+```
+
+### Paper Trading Traceability
+
+Paper runs now expose clearer operational traces:
+- signal detected
+- signal alert sent
+- entry attempted/executed
+- order placement failed/success
+- protection status
+- exit result and realized pnl
+- paper equity snapshots in ops status artifacts
+- shared `trace_id` to follow signal → entry → monitor → exit
+
+### Operational Alerts (Optional)
+
+When enabled, Telegram can receive rate-limited alerts for:
+- startup
+- suspension activated/cleared
+- order failure (relevant stage)
+- protection failure
+- orphan detected/resumed/unrecoverable
+- hourly/daily operational summaries
+
 ## Stage 2 Analysis (Offline Only)
 
 Stage 2 tooling is focused on diagnosis/validation/experimentation.
