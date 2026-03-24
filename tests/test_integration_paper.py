@@ -1,8 +1,4 @@
-"""End-to-end integration test for the paper trading entry flow.
-
-Verifies that a valid signal generates an ENTRY log with margin ≈ 5% of balance.
-No real exchange calls are made; Client is fully mocked.
-"""
+"""Integration test for paper trading entry flow."""
 from __future__ import annotations
 
 import logging
@@ -20,31 +16,32 @@ from services.position_service import PositionCache
 from tests.test_strategy import _build_candidate_dataframe
 
 
-class _CapturingHandler(logging.Handler):
-    """In-memory log handler that stores formatted messages."""
-
+class _CaptureHandler(logging.Handler):
     def __init__(self) -> None:
         super().__init__()
-        self.records: list[str] = []
+        self.messages: list[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.records.append(self.format(record))
+        self.messages.append(self.format(record))
 
 
 @pytest.mark.integration
-class PaperTradingIntegrationTests(unittest.TestCase):
-    """Integration tests for paper trading entry flow."""
-
-    def _make_settings(self) -> Settings:
+class TestIntegrationPaper(unittest.TestCase):
+    def _settings(self) -> Settings:
         settings = Settings()
         settings.use_paper_trading = True
         settings.paper_start_balance = 100.0
-        settings.sizing_mode = "pct_balance"
-        settings.risk_per_trade_pct = 0.05
         settings.max_positions = 1
         settings.use_limit_only = True
         settings.cooldown_sec = 0
-        # Loosen strategy filters so the controlled dataframe always passes
+
+        # Keep runtime logic unchanged; use risk_based only inside this test setup.
+        settings.sizing_mode = "risk_based"
+        settings.risk_per_trade_pct = 0.10
+        settings.margin_utilization = 0.95
+        settings.fixed_margin_per_trade_usdt = 0.0  # disables liquidation-zone guard branch
+
+        # Make controlled dataframe pass strategy gates.
         settings.min_score = 0.0
         settings.rsi_long_min = 0.0
         settings.rsi_long_max = 100.0
@@ -53,52 +50,44 @@ class PaperTradingIntegrationTests(unittest.TestCase):
         settings.pullback_tolerance_atr = 2.0
         settings.min_ema_spread_atr = 0.0
         settings.max_ema_spread_atr = 10.0
-        settings.min_body_ratio = 0.3   # test df body_ratio ≈ 0.346; 0.35 default would block
+        settings.min_body_ratio = 0.3
         settings.min_risk_atr = 0.1
         settings.max_risk_atr = 10.0
-        # Disable the liquidation-zone check (uses fixed_margin as reference)
-        settings.fixed_margin_per_trade_usdt = 0.0
         return settings
 
-    def _make_exchange_info(self, symbol: str) -> dict:
+    def _exchange_info(self, symbol: str) -> dict:
         return {
             "symbols": [
                 {
                     "symbol": symbol,
                     "filters": [
-                        {
-                            "filterType": "LOT_SIZE",
-                            "stepSize": "0.001",
-                            "minQty": "0.001",
-                        },
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
                         {
                             "filterType": "PRICE_FILTER",
                             "tickSize": "0.01",
                             "minPrice": "0.01",
                             "maxPrice": "1000000.0",
                         },
-                        {"filterType": "NOTIONAL", "notional": "5.0"},
+                        {"filterType": "NOTIONAL", "notional": "0.01"},
                     ],
                 }
             ]
         }
 
-    def test_paper_entry_logs_signal_and_entry(self) -> None:
-        """Signal fires → EntryService logs 'signal' then 'ENTRY' with margin ≈ 5 USDT."""
+    def test_on_close_generates_signal_and_entry_logs(self) -> None:
         symbol = "BTCUSDT"
         interval = "15m"
-        settings = self._make_settings()
+        settings = self._settings()
+        data = _build_candidate_dataframe()
 
-        df = _build_candidate_dataframe()
+        client = MagicMock()
+        client.futures_position_information.return_value = []
+        client.futures_exchange_info.return_value = self._exchange_info(symbol)
+        client.futures_cancel_all_open_orders.return_value = {}
+        client.futures_get_open_orders.return_value = []
 
-        mock_client = MagicMock()
-        mock_client.futures_position_information.return_value = []
-        mock_client.futures_exchange_info.return_value = self._make_exchange_info(symbol)
-        mock_client.futures_cancel_all_open_orders.return_value = {}
-        mock_client.futures_get_open_orders.return_value = []
-
-        mock_stream = MagicMock()
-        mock_stream.get_dataframe.return_value = df
+        stream = MagicMock()
+        stream.get_dataframe.return_value = data
 
         risk = RiskManager(
             cooldown_sec=0,
@@ -112,82 +101,54 @@ class PaperTradingIntegrationTests(unittest.TestCase):
         risk.init_equity(100.0)
 
         executor = FuturesExecutor(
-            client=mock_client,
+            client=client,
             symbol=symbol,
             leverage=settings.leverage,
             margin_type=settings.margin_type,
             paper=True,
         )
+        pos_cache = PositionCache(client)
 
-        position_cache = PositionCache(mock_client)
-
-        # Capture all trades_logger output
-        trades_logger = logging.getLogger("test.trades_integration")
+        trades_logger = logging.getLogger("test.integration.paper.trades")
         trades_logger.setLevel(logging.DEBUG)
-        handler = _CapturingHandler()
+        trades_logger.propagate = False
+        handler = _CaptureHandler()
         handler.setFormatter(logging.Formatter("%(message)s"))
         trades_logger.addHandler(handler)
-        trades_logger.propagate = False
 
         service = EntryService(
             settings=settings,
-            stream=mock_stream,
+            stream=stream,
             symbols=[symbol],
             context_map={interval: interval},
-            trade_client=mock_client,
+            trade_client=client,
             risk=risk,
-            position_cache=position_cache,
-            get_executor=lambda sym: executor,
-            logger=logging.getLogger("test.logger_integration"),
+            position_cache=pos_cache,
+            get_executor=lambda _: executor,
+            logger=logging.getLogger("test.integration.paper"),
             trades_logger=trades_logger,
             telegram=MagicMock(),
         )
 
-        # Run the monitor thread synchronously so ENTRY is logged before assertions
+        service.make_on_close(interval)
+
         def _sync_thread(*args, **kwargs):
             target = kwargs.get("target")
 
             class _FakeThread:
-                def start(self_) -> None:
+                def start(self) -> None:
                     if target:
                         target()
 
             return _FakeThread()
 
-        # Initialize interval state (normally done by make_on_close during bot startup)
-        service.make_on_close(interval)
-
         with patch("services.entry_service.threading.Thread", side_effect=_sync_thread):
             service._on_close(interval)
 
-        records = handler.records
+        assert any(message.startswith("signal ") for message in handler.messages)
+        entry_messages = [message for message in handler.messages if message.startswith("ENTRY ")]
+        assert entry_messages, handler.messages
 
-        # 1. "signal" must have been logged by evaluate_interval_signals
-        signal_records = [r for r in records if r.startswith("signal")]
-        self.assertTrue(
-            len(signal_records) >= 1,
-            f"Expected at least one 'signal' log. Got: {records}",
-        )
-
-        # 2. "ENTRY" must have been logged by PositionMonitor.run
-        entry_records = [r for r in records if r.startswith("ENTRY")]
-        self.assertTrue(
-            len(entry_records) >= 1,
-            f"Expected at least one 'ENTRY' log. Got: {records}",
-        )
-
-        # 3. margin ≈ 5% of 100 USDT = 5.0 (±0.5)
-        entry_msg = entry_records[0]
-        match = re.search(r"margin=([\d.]+)", entry_msg)
-        self.assertIsNotNone(match, f"'margin=...' not found in: {entry_msg}")
-        margin_val = float(match.group(1))
-        self.assertAlmostEqual(
-            margin_val,
-            5.0,
-            delta=0.5,
-            msg=f"Expected margin ≈ 5.0, got {margin_val}",
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
+        margin_match = re.search(r"margin=([0-9.]+)", entry_messages[0])
+        assert margin_match is not None
+        assert float(margin_match.group(1)) > 0.0

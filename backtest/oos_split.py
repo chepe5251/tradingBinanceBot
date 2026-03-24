@@ -1,29 +1,7 @@
 #!/usr/bin/env python3
-"""Out-of-sample (OOS) validation on an existing backtest CSV.
+"""Out-of-sample (OOS) validation for backtest trade CSV files.
 
-Splits a trade-level CSV into an in-sample and an out-of-sample period and
-computes metrics for each half. This tests whether the strategy edge holds
-on data it was never calibrated against.
-
-If in-sample performance is materially better than OOS, the strategy may be
-overfit to the historical period used for parameter selection.
-
-Usage (from repo root):
-    # Split by date — trades before 2026-03-01 = IS, from 2026-03-01 = OOS
-    python backtest/oos_split.py --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \\
-        --split 2026-03-01
-
-    # Split by percentage — first 70% = IS, last 30% = OOS
-    python backtest/oos_split.py --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \\
-        --pct 0.7
-
-Options:
-    --csv PATH      Path to the backtest trade CSV (required)
-    --split DATE    ISO date to split IS/OOS (e.g. 2026-03-01)
-    --pct FLOAT     Fraction of trades for in-sample (e.g. 0.7 = 70%)
-
-NOTE: This script does NOT change the live bot, strategy parameters, sizing,
-      leverage, or any production behaviour. It is a pure analysis tool.
+Offline-only analysis tool. It does not alter live runtime behaviour.
 """
 from __future__ import annotations
 
@@ -31,123 +9,230 @@ import argparse
 import csv
 import os
 import sys
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from analysis.metrics import compute_stats, oos_split  # noqa: E402
+from analysis.metrics import (  # noqa: E402
+    classify_oos_stability,
+    compare_period_stats,
+    compute_stats,
+    oos_split,
+    split_by_dates,
+    top_winner_concentration,
+)
+from analysis.reporting import markdown_table  # noqa: E402
 
-# ── helpers ────────────────────────────────────────────────────────────────────
 
 def _load_trades(csv_path: str) -> list[dict]:
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        trades = []
+    trades: list[dict] = []
+    with open(csv_path, newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
         for row in reader:
-            row["pnl_usdt"]     = float(row.get("pnl_usdt", 0) or 0)
-            row["candles_held"] = int(float(row.get("candles_held", 0) or 0))
-            row["score"]        = float(row.get("score", 0) or 0)
+            row["pnl_usdt"] = float(row.get("pnl_usdt", 0.0) or 0.0)
+            row["score"] = float(row.get("score", 0.0) or 0.0)
+            row["vol_ratio"] = float(row.get("vol_ratio", 0.0) or 0.0)
+            row["body_ratio"] = float(row.get("body_ratio", 0.0) or 0.0)
+            row["ema_spread"] = float(row.get("ema_spread", 0.0) or 0.0)
             trades.append(row)
     return trades
 
 
-def _usd(v: float) -> str:
-    return f"{v:+.2f}"
+def _period_rows(periods: list[tuple[str, list[dict]]]) -> list[dict]:
+    rows: list[dict] = []
+    if not periods:
+        return rows
+    baseline_stats = compute_stats(periods[0][1])
+    for index, (label, period_trades) in enumerate(periods):
+        stats = compute_stats(period_trades)
+        top_rows = top_winner_concentration(period_trades, ns=[5])
+        top5_pct = top_rows[0]["pct_of_total"] if top_rows else 0.0
+        if index == 0:
+            verdict = "baseline"
+            comparison = compare_period_stats(baseline_stats, stats)
+        else:
+            verdict = classify_oos_stability(baseline_stats, stats)
+            comparison = compare_period_stats(baseline_stats, stats)
+        rows.append(
+            {
+                "period": label,
+                "trades": stats["total"],
+                "winrate": stats["winrate"],
+                "profit_factor": stats["profit_factor"],
+                "expectancy": stats["expectancy"],
+                "total_pnl": stats["total_pnl"],
+                "max_dd_pct": stats["max_dd_pct"],
+                "top5_pct": top5_pct,
+                "verdict": verdict,
+                "comparison": comparison,
+            }
+        )
+    return rows
 
 
-def _print_stats_block(label: str, s: dict) -> None:
-    if s["total"] == 0:
-        print(f"\n  [{label}]  — no trades —")
-        return
-    print(f"\n  [{label}]  {s['total']} trades")
-    print(f"    Win / Loss / Timeout : {s['wins']} / {s['losses']} / {s['timeouts']}")
-    print(f"    Win rate             : {s['winrate']:.2f}%")
-    print(f"    Profit Factor        : {s['profit_factor']:.3f}")
-    print(f"    Total PnL            : {_usd(s['total_pnl'])}")
-    print(f"    Avg PnL              : {_usd(s['avg_pnl'])}")
-    print(f"    Median PnL           : {_usd(s['median_pnl'])}")
-    print(f"    Expectancy           : {_usd(s['expectancy'])}")
-    print(f"    Avg Win              : {_usd(s['avg_win'])}")
-    print(f"    Avg Loss             : {_usd(s['avg_loss'])}")
-    print(f"    RR real              : {s['rr_real']:.3f}")
-    print(f"    Best trade           : {_usd(s['best_trade'])}")
-    print(f"    Worst trade          : {_usd(s['worst_trade'])}")
-    print(f"    Max Drawdown         : {_usd(s['max_drawdown'])} ({s['max_dd_pct']:.2f}%)")
-    print(f"    Max Win / Loss streak: {s['max_win_streak']} / {s['max_loss_streak']}")
+def _print_rows(rows: list[dict]) -> None:
+    print(
+        f"{'period':<32} {'N':>6} {'WR%':>7} {'PF':>7} {'Exp':>10} "
+        f"{'PnL':>10} {'DD%':>7} {'Top5%':>8} {'verdict':>24}"
+    )
+    print("-" * 124)
+    for row in rows:
+        print(
+            f"{row['period']:<32} {row['trades']:>6} {row['winrate']:>6.2f} {row['profit_factor']:>7.3f} "
+            f"{row['expectancy']:>+10.4f} {row['total_pnl']:>+10.2f} {row['max_dd_pct']:>6.2f} "
+            f"{row['top5_pct']:>7.1f} {row['verdict']:>24}"
+        )
+
+    if len(rows) > 1:
+        print("\nComparison vs baseline (delta):")
+        print(
+            f"{'period':<32} {'dWR':>9} {'dPF':>9} {'dExp':>11} {'dPnL':>11} {'dDD%':>9} {'PF_ratio%':>11}"
+        )
+        print("-" * 96)
+        for row in rows[1:]:
+            cmp = row["comparison"]
+            pf_ratio = cmp.get("ratio_profit_factor_pct")
+            pf_ratio_txt = "-" if pf_ratio is None else f"{pf_ratio:>10.1f}"
+            print(
+                f"{row['period']:<32} {cmp['delta_winrate']:>+9.2f} {cmp['delta_profit_factor']:>+9.3f} "
+                f"{cmp['delta_expectancy']:>+11.4f} {cmp['delta_total_pnl']:>+11.2f} "
+                f"{cmp['delta_max_dd_pct']:>+9.2f} {pf_ratio_txt:>11}"
+            )
 
 
-def _print_comparison(s_is: dict, s_oos: dict) -> None:
-    def _arrow(v_is: float, v_oos: float, higher_is_better: bool = True) -> str:
-        better = v_oos > v_is if higher_is_better else v_oos < v_is
-        same   = abs(v_oos - v_is) < 1e-9
-        if same:
-            return "="
-        return "+" if better else "-"
+def _save_csv(rows: list[dict], output_path: str) -> None:
+    fields = [
+        "period",
+        "trades",
+        "winrate",
+        "profit_factor",
+        "expectancy",
+        "total_pnl",
+        "max_dd_pct",
+        "top5_pct",
+        "verdict",
+        "delta_winrate",
+        "delta_profit_factor",
+        "delta_expectancy",
+        "delta_total_pnl",
+        "delta_max_dd_pct",
+        "ratio_profit_factor_pct",
+    ]
+    with open(output_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            cmp = row["comparison"]
+            writer.writerow(
+                {
+                    "period": row["period"],
+                    "trades": row["trades"],
+                    "winrate": round(row["winrate"], 6),
+                    "profit_factor": round(row["profit_factor"], 6),
+                    "expectancy": round(row["expectancy"], 8),
+                    "total_pnl": round(row["total_pnl"], 8),
+                    "max_dd_pct": round(row["max_dd_pct"], 8),
+                    "top5_pct": round(row["top5_pct"], 6),
+                    "verdict": row["verdict"],
+                    "delta_winrate": round(cmp.get("delta_winrate", 0.0), 6),
+                    "delta_profit_factor": round(cmp.get("delta_profit_factor", 0.0), 6),
+                    "delta_expectancy": round(cmp.get("delta_expectancy", 0.0), 8),
+                    "delta_total_pnl": round(cmp.get("delta_total_pnl", 0.0), 8),
+                    "delta_max_dd_pct": round(cmp.get("delta_max_dd_pct", 0.0), 8),
+                    "ratio_profit_factor_pct": cmp.get("ratio_profit_factor_pct"),
+                }
+            )
 
-    print("\n  Comparison  (IS → OOS):")
-    print(f"    Win rate  : {s_is['winrate']:>6.2f}% → {s_oos['winrate']:>6.2f}%"
-          f"  [{_arrow(s_is['winrate'], s_oos['winrate'])}]")
-    print(f"    PF        : {s_is['profit_factor']:>6.3f}  → {s_oos['profit_factor']:>6.3f} "
-          f" [{_arrow(s_is['profit_factor'], s_oos['profit_factor'])}]")
-    print(f"    Expectancy: {s_is['expectancy']:>+7.4f} → {s_oos['expectancy']:>+7.4f}"
-          f"  [{_arrow(s_is['expectancy'], s_oos['expectancy'])}]")
-    print(f"    RR real   : {s_is['rr_real']:>6.3f}  → {s_oos['rr_real']:>6.3f} "
-          f" [{_arrow(s_is['rr_real'], s_oos['rr_real'])}]")
 
-    # Simple verdict
-    degrades = sum([
-        s_oos["winrate"]        < s_is["winrate"]        * 0.9,
-        s_oos["profit_factor"]  < s_is["profit_factor"]  * 0.9,
-        s_oos["expectancy"]     < s_is["expectancy"]     * 0.9,
-    ])
-    if s_oos["total"] == 0:
-        verdict = "OOS period has no trades — cannot evaluate."
-    elif degrades >= 2:
-        verdict = "DEGRADATION detected: OOS materially worse than IS. Possible overfit."
-    elif degrades == 1:
-        verdict = "MILD degradation on one metric. Monitor carefully."
-    else:
-        verdict = "STABLE: OOS metrics broadly in line with IS."
-    print(f"\n  Verdict: {verdict}")
+def _save_markdown(rows: list[dict], output_path: str) -> None:
+    table_rows = [
+        [
+            row["period"],
+            str(row["trades"]),
+            f"{row['winrate']:.2f}",
+            f"{row['profit_factor']:.3f}",
+            f"{row['expectancy']:+.4f}",
+            f"{row['total_pnl']:+.2f}",
+            f"{row['max_dd_pct']:.2f}",
+            f"{row['top5_pct']:.1f}",
+            row["verdict"],
+        ]
+        for row in rows
+    ]
+    with open(output_path, "w", encoding="utf-8") as handle:
+        handle.write("# OOS Validation\n\n")
+        handle.write(
+            markdown_table(
+                ["Period", "Trades", "WR %", "PF", "Expectancy", "PnL", "Max DD %", "Top5 %", "Verdict"],
+                table_rows,
+            )
+        )
+        if len(rows) > 1:
+            handle.write("\n\n## Delta vs baseline\n\n")
+            delta_rows = []
+            for row in rows[1:]:
+                cmp = row["comparison"]
+                pf_ratio = cmp.get("ratio_profit_factor_pct")
+                delta_rows.append(
+                    [
+                        row["period"],
+                        f"{cmp['delta_winrate']:+.2f}",
+                        f"{cmp['delta_profit_factor']:+.3f}",
+                        f"{cmp['delta_expectancy']:+.4f}",
+                        f"{cmp['delta_total_pnl']:+.2f}",
+                        f"{cmp['delta_max_dd_pct']:+.2f}",
+                        "-" if pf_ratio is None else f"{pf_ratio:.1f}",
+                    ]
+                )
+            handle.write(
+                markdown_table(
+                    ["Period", "dWR", "dPF", "dExp", "dPnL", "dDD%", "PF ratio %"],
+                    delta_rows,
+                )
+            )
 
 
-# ── main ───────────────────────────────────────────────────────────────────────
+def _build_periods(args, trades: list[dict]) -> list[tuple[str, list[dict]]]:
+    if args.splits:
+        return split_by_dates(trades, args.splits)
+    if args.split:
+        ins, oos = oos_split(trades, split_date=args.split)
+        return [("in_sample", ins), ("out_of_sample", oos)]
+    ins, oos = oos_split(trades, split_pct=args.pct)
+    return [("in_sample", ins), ("out_of_sample", oos)]
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="In-sample vs out-of-sample validation on backtest CSV",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument("--csv", required=True, help="Path to backtest trade CSV")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--split", help="ISO date to split IS/OOS (e.g. 2026-03-01)")
-    group.add_argument("--pct",   type=float, help="Fraction for in-sample (0..1), e.g. 0.7")
+    parser = argparse.ArgumentParser(description="OOS validation for backtest trades")
+    parser.add_argument("--csv", required=True, help="Backtest trade CSV path")
+    split_group = parser.add_mutually_exclusive_group(required=True)
+    split_group.add_argument("--split", help="Date split YYYY-MM-DD")
+    split_group.add_argument("--pct", type=float, help="IS fraction in (0,1]")
+    split_group.add_argument("--splits", nargs="+", help="Multiple date cuts (2+)")
+    parser.add_argument("--output", default=None, help="Optional output CSV path")
+    parser.add_argument("--markdown", default=None, help="Optional markdown output path")
     args = parser.parse_args()
 
     trades = _load_trades(args.csv)
     if not trades:
-        print("No trades found. Exiting.")
+        print("No trades loaded.")
         return
-    print(f"Loaded {len(trades)} trades from {args.csv}")
+    periods = _build_periods(args, trades)
+    rows = _period_rows(periods)
+    _print_rows(rows)
 
-    if args.split:
-        ins, oos  = oos_split(trades, split_date=args.split)
-        split_lbl = f"date={args.split}"
+    if args.output:
+        output_path = args.output
     else:
-        ins, oos  = oos_split(trades, split_pct=args.pct)
-        split_lbl = f"pct={args.pct:.0%}"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"oos_summary_{ts}.csv")
+    _save_csv(rows, output_path)
+    print(f"\nSaved CSV: {output_path}")
 
-    print(f"Split: {split_lbl}  →  IS={len(ins)} trades, OOS={len(oos)} trades")
-    print("=" * 60)
-
-    s_is  = compute_stats(ins)
-    s_oos = compute_stats(oos)
-
-    _print_stats_block("IN-SAMPLE",      s_is)
-    _print_stats_block("OUT-OF-SAMPLE",  s_oos)
-
-    if ins and oos:
-        _print_comparison(s_is, s_oos)
-    print()
+    if args.markdown:
+        _save_markdown(rows, args.markdown)
+        print(f"Saved markdown: {args.markdown}")
 
 
 if __name__ == "__main__":

@@ -1,179 +1,173 @@
-# Backtest & Analysis (Stage 2)
+# Backtest and Stage 2 Analysis
 
-`backtest/backtest.py` downloads Binance Futures klines, simulates trades candle-by-candle, and writes three CSV files per run:
+`backtest/backtest.py` simulates trades and writes:
+- `backtest/results/backtest_*.csv` (trade rows)
+- `backtest/results/analysis_*.csv` (segment aggregates)
+- `backtest/results/equity_*.csv` (equity/drawdown)
 
-| File | Contents |
-|---|---|
-| `backtest_YYYYMMDD_HHMMSS.csv` | One row per simulated trade with full metadata |
-| `analysis_YYYYMMDD_HHMMSS.csv` | Metrics grouped by interval, score, phase, vol, RSI, etc. |
-| `equity_YYYYMMDD_HHMMSS.csv` | Equity curve with cumulative PnL and drawdown per trade |
+## Scope Guard (Critical)
 
-**IMPORTANT — Stage 2 does NOT change live bot behaviour.**
-All scripts in this directory are pure analysis tools. They do not modify leverage,
-sizing, exposure, or any production parameter.
+All Stage 2 tools are offline analysis only.
 
----
+They do **not** modify:
+- leverage
+- live sizing behavior
+- margin per trade in production
+- max exposure / max positions
+- live defaults
+- entry/exit runtime logic
 
-## Standard backtest
+Any candidate improvement must be validated offline and only then considered
+for a future gated runtime flag.
+
+## 1) Run Standard Backtest
 
 ```bash
 python backtest/backtest.py
 ```
 
-Reads `.env` for API keys and strategy parameters.
+## 2) Regime Analysis
 
-### Console output sections
+`analysis/regime.py` labels each trade using deterministic snapshot features:
+- `trend_regime`
+- `volatility_regime`
+- `structure_regime`
+- `combined_regime` (`trend|volatility`)
 
-| Section | What it shows |
-|---|---|
-| 1. Resumen general | Total trades, WR, PF, expectancy, median PnL, best/worst trade |
-| 2. Por timeframe y side | Performance per interval × direction |
-| 3. Por score | Performance per signal score band |
-| 4. Por duración | Performance by candles held |
-| 5. Por market phase | UPTREND / DOWNTREND / MIXED EMA alignment |
-| 6. Por volumen | Performance by vol_ratio at signal |
-| 7. Por RSI | Performance by RSI band at signal |
-| 8. Top 5 mejores/peores pares | Best and worst symbols |
-| 9. Trades descartados | 4H SELL filter + score < 1.0 filter |
-| 10. Equity curve y drawdown | Max DD, Calmar, consecutive streaks |
-| 11. Frecuencia de trades | Trades/day, active days |
-| 12. Concentración de top winners | What % of PnL comes from top 1/5/10/20 trades |
-| 13. Archivos generados | Output CSV paths |
-
----
-
-## Walk-forward analysis
-
-Tests temporal consistency — does performance hold across different time periods?
-
-```bash
-# Default: 30-day windows, 15-day step
-python backtest/walk_forward.py --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv
-
-# Custom windows
-python backtest/walk_forward.py \
-    --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
-    --window 45 --step 15
-```
-
-**Output:** `backtest/results/walk_forward_YYYYMMDD_HHMMSS.csv` — one row per window.
-
-**How to interpret:**
-- A strategy with stable edge shows consistent WR and PF across all windows.
-- If ≥75% of windows have PF > 1.0 → verdict: CONSISTENT.
-- If <50% of windows have PF > 1.0 → verdict: INCONSISTENT (performance clustered in specific periods).
-- High variance between windows suggests time-dependency worth investigating.
-
----
-
-## Out-of-sample validation
-
-Split a backtest into an in-sample (IS) and out-of-sample (OOS) period and compare metrics.
-
-```bash
-# Split by date
-python backtest/oos_split.py \
-    --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
-    --split 2026-03-01
-
-# Split by percentage (70% IS, 30% OOS)
-python backtest/oos_split.py \
-    --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
-    --pct 0.7
-```
-
-**How to interpret:**
-- If OOS metrics are broadly similar to IS → edge is likely real.
-- If OOS WR / PF / expectancy degrades >10% vs IS → potential overfit to the IS period.
-- The script prints a `Verdict` line: STABLE / MILD degradation / DEGRADATION detected.
-
-**Note:** Because this strategy uses fixed parameters from `.env` (not optimised per backtest
-period), OOS degradation would reflect market non-stationarity rather than curve-fitting.
-
----
-
-## Market regime analysis
-
-The backtest CSV already contains a `market_phase` column (UPTREND / DOWNTREND / MIXED)
-and a `vol_ratio` column. Use `analysis/regime.py` or filter the CSV directly:
-
-```bash
-# From Python — analyse existing CSV
-python - <<'EOF'
-import csv, sys
-sys.path.insert(0, ".")
-from analysis.metrics import compute_stats, segment_trades
-from analysis.regime import add_regime_labels, regime_analysis, print_regime_report
-
-with open("backtest/results/backtest_YYYYMMDD_HHMMSS.csv") as f:
-    trades = list(csv.DictReader(f))
-
-for t in trades:
-    t["pnl_usdt"] = float(t["pnl_usdt"])
-    t["vol_ratio"] = float(t.get("vol_ratio", 0))
-
-report = regime_analysis(trades)
-print_regime_report(report)
-EOF
-```
-
-Regime dimensions:
-- **Market phase** (EMA alignment): UPTREND / DOWNTREND / MIXED
-- **Volatility** (vol_ratio ≥ 1.5 = HIGH_VOL, else LOW_VOL)
-- **Combined**: e.g. UPTREND_HIGH_VOL
-
----
-
-## Top-winner concentration
-
-Section 12 of the backtest report already shows concentration for top 1/5/10/20 trades.
-For more detail, use `analysis/metrics.py`:
+Use from Python:
 
 ```python
-from analysis.metrics import top_winner_concentration
-rows = top_winner_concentration(trades)
-for r in rows:
-    print(f"Top {r['n']:>2}: {r['pct_of_total']:+.1f}% of PnL | "
-          f"Rest PF={r['stats_excl']['profit_factor']:.2f} "
-          f"Exp={r['stats_excl']['expectancy']:+.3f}")
+import csv
+from analysis.regime import add_regime_labels, regime_analysis, print_regime_report
+
+with open("backtest/results/backtest_YYYYMMDD_HHMMSS.csv", encoding="utf-8") as f:
+    trades = list(csv.DictReader(f))
+for t in trades:
+    t["pnl_usdt"] = float(t["pnl_usdt"])
+    t["ema_spread"] = float(t.get("ema_spread", 0) or 0)
+    t["vol_ratio"] = float(t.get("vol_ratio", 0) or 0)
+    t["body_ratio"] = float(t.get("body_ratio", 0) or 0)
+
+add_regime_labels(trades)
+report = regime_analysis(trades)
+print_regime_report(report)
 ```
 
-**Interpretation:**
-- Top-5 > 70% of PnL → edge may be fragile (outlier-dependent).
-- `stats_excl` with positive expectancy → edge exists beyond outliers.
-- `stats_excl` with negative expectancy → removing outliers turns strategy unprofitable.
+## 3) Walk-Forward Robustness
 
----
+```bash
+python backtest/walk_forward.py \
+  --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
+  --mode rolling --window 30 --step 15
+```
 
-## Potential filter analysis
+Also supports:
+- `--mode expanding`
+- `--output` (CSV path)
+- `--markdown` (optional markdown summary)
 
-The `analysis_YYYYMMDD_HHMMSS.csv` segments performance across all key dimensions:
-`interval`, `score_range`, `market_phase`, `vol_ratio`, `rsi_at_signal`, `ema_spread`,
-`body_ratio`, `hour_utc`, `weekday`.
+Per-window metrics include:
+- trades
+- pnl
+- winrate
+- expectancy
+- profit factor
+- max drawdown %
+- top-winner concentration (Top5 %)
 
-To identify consistently bad segments:
-1. Open the analysis CSV in a spreadsheet.
-2. Filter rows where `profit_factor < 1.0` and `total_trades > 5`.
-3. Those segments are candidates for filtering.
+Global summary includes:
+- % windows with PF > 1
+- % windows with positive expectancy
+- % windows with positive PnL
+- variance/stdev indicators
+- high-drawdown window count
+- consistency verdict
 
-**Any filter improvements must be tested in backtest first and enabled only via `.env`
-flags — never automatically applied to the live bot.**
+## 4) OOS Validation
 
----
+Single cut by date:
 
-## Key parameters
+```bash
+python backtest/oos_split.py \
+  --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
+  --split 2026-03-01
+```
 
-| Parameter | Source | Default |
-|---|---|---|
-| TOP_SYMBOLS | `top_volume_symbols_count` in `config.py` | 300 |
-| INTERVALS | Derived from `MAIN_INTERVAL`, `CONTEXT_INTERVAL` | 15m, 1h, 4h |
-| MARGIN_PER_TRADE | `FIXED_MARGIN_PER_TRADE_USDT` | 5 USDT |
-| LEVERAGE | `LEVERAGE` | 20x |
-| MAX_CANDLES_HOLD | Hardcoded | 50 candles |
+By percentage:
 
-## Notes
+```bash
+python backtest/oos_split.py \
+  --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
+  --pct 0.7
+```
 
-- SELL trades are blocked on `4h` to mirror live long-only behaviour.
-- Phase 1 download uses 60 parallel threads; Phase 2 simulation uses `cpu_count` processes.
-- Rate limiter enforces Binance weight budget (2300 req/min).
-- `statistics` module (stdlib) is the only dependency added in Stage 2.
+Multi-cut:
+
+```bash
+python backtest/oos_split.py \
+  --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
+  --splits 2026-02-01 2026-03-01 2026-04-01
+```
+
+Optional exports:
+- `--output` CSV
+- `--markdown` markdown summary
+
+Verdicts:
+- `estabilidad_aceptable`
+- `degradacion_leve`
+- `degradacion_moderada`
+- `degradacion_severa`
+
+## 5) Candidate Filter Framework (Offline)
+
+`analysis/filter_experiments.py` supports baseline vs variants:
+- min/max score
+- include/exclude symbols
+- include/exclude intervals
+- include/exclude hours
+- include/exclude weekdays
+- market phase / regime filters
+- AND/OR combinations
+
+Example:
+
+```python
+import csv
+from analysis.filter_experiments import (
+    compare_variants,
+    combine_filters,
+    filter_min_score,
+    filter_exclude_weekdays,
+    save_experiment_csv,
+    save_experiment_markdown,
+)
+
+with open("backtest/results/backtest_YYYYMMDD_HHMMSS.csv", encoding="utf-8") as f:
+    trades = list(csv.DictReader(f))
+for t in trades:
+    t["pnl_usdt"] = float(t["pnl_usdt"])
+    t["score"] = float(t.get("score", 0) or 0)
+
+variants = {
+    "baseline": None,
+    "score>=2.0": filter_min_score(2.0),
+    "score>=2.0_no_weekend": combine_filters([
+        filter_min_score(2.0),
+        filter_exclude_weekdays({"Sat", "Sun"}),
+    ]),
+}
+results = compare_variants(trades, variants)
+save_experiment_csv(results, "backtest/results/filter_experiments.csv")
+save_experiment_markdown(results, "backtest/results/filter_experiments.md")
+```
+
+## 6) Comparative Summary
+
+`analysis/reporting.py` provides pure markdown summary builders to combine:
+- baseline metrics
+- walk-forward summary
+- OOS comparison rows
+- filter-variant rows
+
+Use it to generate fast decision docs without touching runtime code.
