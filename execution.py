@@ -689,7 +689,7 @@ class FuturesExecutor:
                 exit_p = 0.0
                 try:
                     exit_p = float(price_fn()) if price_fn else float(current_entry or 0.0)
-                except Exception:
+                except Exception:  # price_fn is caller-provided; fall back to entry price
                     exit_p = float(current_entry or 0.0)
                 return "EARLY:max_hold_timeout", exit_p
 
@@ -702,7 +702,7 @@ class FuturesExecutor:
                         "break_even": break_even, "breakeven_trigger_pct": float(current_be_trigger),
                         "tp_ref": tp_ref, "sl_ref": sl_ref,
                     })
-                except Exception:
+                except Exception:  # scale_fn is caller-provided; treat any error as no-op
                     updates = None
                 if isinstance(updates, dict):
                     if updates.get("close_all"):
@@ -747,7 +747,7 @@ class FuturesExecutor:
                 if not break_even:
                     try:
                         should_exit, reason = review_fn(break_even)
-                    except Exception:
+                    except Exception:  # review_fn is caller-provided; skip exit on error
                         should_exit, reason = False, ""
                     if should_exit:
                         try:
@@ -760,7 +760,7 @@ class FuturesExecutor:
             if side and current_entry and current_qty and price_fn:
                 try:
                     price = float(price_fn())
-                except Exception:
+                except Exception:  # price_fn is caller-provided; skip tick on error
                     price = None
                 if price is not None:
                     if current_sl is None:
@@ -782,7 +782,7 @@ class FuturesExecutor:
                         if atr_fn:
                             try:
                                 atr_use = float(atr_fn())
-                            except Exception:
+                            except Exception:  # atr_fn is caller-provided; fall back to snapshot ATR
                                 atr_use = atr
                         if atr_use and atr_use > 0:
                             current_sl, current_tp, last_replace, tp_ref, sl_ref = self._handle_trailing(

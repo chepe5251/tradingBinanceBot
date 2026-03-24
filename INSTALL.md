@@ -21,6 +21,15 @@ Install deps:
 pip install -r requirements.txt
 ```
 
+Key dependencies (pinned in `requirements.txt`):
+- `python-binance==1.0.34`
+- `pandas==3.0.0`
+- `numpy==2.4.2`
+- `requests==2.32.5`
+- `websockets==16.0`
+- `aiohttp==3.13.3`
+- `pytest==9.0.2`
+
 ## 2. Configure environment
 ```bash
 cp .env.example .env
@@ -43,6 +52,7 @@ python main.py
 Logs:
 - Console runtime logs
 - `logs/trades.log`
+- `logs/risk_state.json` — persisted risk state, reloaded on restart
 
 ## 4. Run backtest
 ```bash
@@ -51,7 +61,16 @@ python backtest/backtest.py
 
 Output CSV files are generated in `backtest/results/`.
 
-## 5. Common checks
+## 5. Run tests
+```bash
+python -m pytest tests/ -v
+```
+
+Tests run without a Binance API key. The pytest `pythonpath = ["."]` config in
+`pyproject.toml` ensures module imports resolve correctly from the repo root.
+
+## 6. Common checks
 - Missing API keys in live mode: bot fails fast at startup
 - Scheduler health: heartbeat updates `logs/.alive`
-- Symbol universe: top **300** USDT perpetual symbols by 24h quote volume (hardcoded; cannot be changed via `.env`). Use `EXTRA_SYMBOLS` to add symbols on top, or `SYMBOLS` to override entirely.
+- Symbol universe: top **300** USDT perpetual symbols by 24h quote volume (hardcoded;
+  `USE_TOP_VOLUME_SYMBOLS`, `EXTRA_SYMBOLS`, and `SYMBOLS` can filter/extend the set)

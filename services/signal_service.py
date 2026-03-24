@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from config import Settings
-from strategy import evaluate_signal
+from strategy import StrategyConfig, evaluate_signal
 
 
 @dataclass(frozen=True)
@@ -22,29 +22,30 @@ class SignalCandidate:
         return float((self.payload or {}).get("score") or 0.0)
 
 
-def _strategy_kwargs(settings: Settings) -> dict:
-    return {
-        "ema_trend": settings.ema_trend,
-        "ema_fast": settings.ema_fast,
-        "ema_mid": settings.ema_mid,
-        "atr_period": settings.atr_period,
-        "atr_avg_window": settings.atr_avg_window,
-        "volume_avg_window": settings.volume_avg_window,
-        "rsi_period": settings.rsi_period,
-        "rsi_long_min": settings.rsi_long_min,
-        "rsi_long_max": settings.rsi_long_max,
-        "volume_min_ratio": settings.volume_min_ratio,
-        "volume_max_ratio": settings.volume_max_ratio,
-        "pullback_tolerance_atr": settings.pullback_tolerance_atr,
-        "min_ema_spread_atr": settings.min_ema_spread_atr,
-        "max_ema_spread_atr": settings.max_ema_spread_atr,
-        "min_body_ratio": settings.min_body_ratio,
-        "rr_target": settings.rr_target,
-        "min_risk_atr": settings.min_risk_atr,
-        "max_risk_atr": settings.max_risk_atr,
-        "min_score": settings.min_score,
-        "max_atr_avg_ratio": settings.max_atr_avg_ratio,
-    }
+def strategy_config_from_settings(settings: Settings) -> StrategyConfig:
+    """Build a StrategyConfig from the runtime Settings object."""
+    return StrategyConfig(
+        ema_fast=settings.ema_fast,
+        ema_mid=settings.ema_mid,
+        ema_trend=settings.ema_trend,
+        atr_period=settings.atr_period,
+        atr_avg_window=settings.atr_avg_window,
+        volume_avg_window=settings.volume_avg_window,
+        rsi_period=settings.rsi_period,
+        rsi_long_min=settings.rsi_long_min,
+        rsi_long_max=settings.rsi_long_max,
+        volume_min_ratio=settings.volume_min_ratio,
+        volume_max_ratio=settings.volume_max_ratio,
+        pullback_tolerance_atr=settings.pullback_tolerance_atr,
+        min_ema_spread_atr=settings.min_ema_spread_atr,
+        max_ema_spread_atr=settings.max_ema_spread_atr,
+        min_body_ratio=settings.min_body_ratio,
+        rr_target=settings.rr_target,
+        min_risk_atr=settings.min_risk_atr,
+        max_risk_atr=settings.max_risk_atr,
+        min_score=settings.min_score,
+        max_atr_avg_ratio=settings.max_atr_avg_ratio,
+    )
 
 
 def evaluate_interval_signals(
@@ -57,7 +58,7 @@ def evaluate_interval_signals(
 ) -> list[SignalCandidate]:
     """Evaluate all symbols for one timeframe and return sorted candidates."""
     valid_signals: list[SignalCandidate] = []
-    strategy_kwargs = _strategy_kwargs(settings)
+    cfg = strategy_config_from_settings(settings)
 
     for symbol in symbols:
         symbol_df = stream.get_dataframe(symbol, interval)
@@ -67,7 +68,7 @@ def evaluate_interval_signals(
         context_df = (
             stream.get_dataframe(symbol, context_interval) if context_interval else pd.DataFrame()
         )
-        signal = evaluate_signal(symbol_df, context_df, **strategy_kwargs)
+        signal = evaluate_signal(symbol_df, context_df, cfg)
         if not signal:
             continue
 

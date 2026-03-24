@@ -11,18 +11,22 @@ from sizing import SIZING_MODE_PCT_BALANCE, normalize_sizing_mode
 class Settings:
     """Runtime configuration consumed by strategy, execution, and risk layers."""
 
+    # ── Configurable via .env ────────────────────────────────────────────────
     # Trading universe and intervals
     symbol: str = "BTCUSDT"
     symbols: list[str] = field(default_factory=list)
     extra_symbols: list[str] = field(default_factory=list)
     use_top_volume_symbols: bool = True
-    top_volume_symbols_count: int = 300
     top_volume_allowlist: list[str] = field(default_factory=list)
     top_volume_min_price: float = 0.0
     top_volume_min_quote_volume: float = 0.0
     main_interval: str = "15m"
     context_interval: str = "1h"
-    top_symbols_limit: int = 300  # legacy alias used as fallback
+
+    # ── Fixed by design — not overridable via .env ───────────────────────────
+    # Symbol count is intentionally hardcoded so the bot's resource budget
+    # (API weight, memory, CPU) is predictable and tested at this scale.
+    top_volume_symbols_count: int = 300
 
     # Exchange/account
     leverage: int = 20
@@ -196,7 +200,7 @@ def from_env() -> Settings:
         settings.extra_symbols = _parse_list(extra_symbols_raw)
 
     _set_bool(settings, "use_top_volume_symbols", "USE_TOP_VOLUME_SYMBOLS")
-    # top_volume_symbols_count and top_symbols_limit are fixed in code (Settings defaults)
+    # top_volume_symbols_count is fixed in code — not overridable via .env
     _set_float(settings, "top_volume_min_price", "TOP_VOLUME_MIN_PRICE", minimum=0.0)
     _set_float(
         settings,
@@ -295,10 +299,6 @@ def from_env() -> Settings:
     raw = os.getenv("BLOCK_SELL_ON_INTERVALS")
     if raw:
         settings.block_sell_on_intervals = _parse_list(raw)
-
-    # Keep legacy TOP_SYMBOLS_LIMIT behavior as fallback for top count.
-    if settings.top_volume_symbols_count <= 0 and settings.top_symbols_limit > 0:
-        settings.top_volume_symbols_count = settings.top_symbols_limit
 
     # Keep RSI bounds coherent if configured inversely.
     if settings.rsi_long_min > settings.rsi_long_max:

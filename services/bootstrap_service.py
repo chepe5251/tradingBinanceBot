@@ -172,14 +172,9 @@ def load_symbol_universe(settings: Settings, client: Client, logger: logging.Log
         ranked_symbols = filtered_ranked or ranked_symbols
 
         top_count = settings.top_volume_symbols_count
-        if top_count <= 0:
-            top_count = settings.top_symbols_limit
         if top_count > 0:
             ranked_symbols = ranked_symbols[:top_count]
         logger.info("Loaded %d symbols by top-volume filter.", len(ranked_symbols))
-    elif settings.top_symbols_limit > 0:
-        ranked_symbols = ranked_symbols[: settings.top_symbols_limit]
-        logger.info("Loaded top %d symbols (legacy TOP_SYMBOLS_LIMIT).", len(ranked_symbols))
     else:
         logger.info("Loaded all tradable symbols (%d).", len(ranked_symbols))
 

@@ -1,6 +1,7 @@
 """EMA pullback long-only signal engine."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 import pandas as pd
@@ -8,50 +9,66 @@ import pandas as pd
 from indicators import atr_series, ema, rsi
 
 
+@dataclass(frozen=True)
+class StrategyConfig:
+    """All tunable parameters for evaluate_signal.
+
+    Build one instance per run and share it between live and backtest so both
+    always operate from the same configuration source.
+    """
+
+    ema_fast: int = 20
+    ema_mid: int = 50
+    ema_trend: int = 200
+    atr_period: int = 14
+    atr_avg_window: int = 30
+    volume_avg_window: int = 20
+    rsi_period: int = 14
+    rsi_long_min: float = 48.0
+    rsi_long_max: float = 68.0
+    volume_min_ratio: float = 1.05
+    volume_max_ratio: float = 1.5
+    pullback_tolerance_atr: float = 0.8
+    min_ema_spread_atr: float = 0.15
+    max_ema_spread_atr: float = 1.0
+    min_body_ratio: float = 0.35
+    rr_target: float = 2.0
+    min_risk_atr: float = 0.5
+    max_risk_atr: float = 3.0
+    min_score: float = 1.5
+    context_missing_penalty: float = 0.5
+    max_atr_avg_ratio: float = 2.5
+
+
 def evaluate_signal(
     main_df: pd.DataFrame,
     context_df: pd.DataFrame,
-    ema_trend: int,
-    ema_fast: int,
-    ema_mid: int,
-    atr_period: int,
-    atr_avg_window: int,
-    volume_avg_window: int,
-    rsi_period: int,
-    rsi_long_min: float,
-    rsi_long_max: float,
-    volume_min_ratio: float,
-    volume_max_ratio: float = 1.5,
-    pullback_tolerance_atr: float = 0.8,
-    min_ema_spread_atr: float = 0.15,
-    max_ema_spread_atr: float = 1.0,
-    min_body_ratio: float = 0.35,
-    rr_target: float = 2.0,
-    min_risk_atr: float = 0.5,
-    max_risk_atr: float = 3.0,
-    min_score: float = 1.5,
-    context_missing_penalty: float = 0.5,
-    max_atr_avg_ratio: float = 2.5,
+    cfg: StrategyConfig,
 ) -> Optional[dict]:
     """Evaluate one symbol for a long setup.
 
-    All thresholds and windows are consumed from arguments so live and backtest
-    can share the same strategy behavior from a single configuration source.
+    Accepts a StrategyConfig so live runtime and backtest share the exact same
+    parameter source.  Returns None when no qualifying signal is found.
     """
     if main_df.empty:
         return None
-    min_len = max(ema_trend + 3, volume_avg_window + 3, atr_avg_window + 3, rsi_period + 3)
+    min_len = max(
+        cfg.ema_trend + 3,
+        cfg.volume_avg_window + 3,
+        cfg.atr_avg_window + 3,
+        cfg.rsi_period + 3,
+    )
     if len(main_df) < min_len:
         return None
 
     df = main_df.copy()
-    df["ema_fast"] = ema(df["close"], ema_fast)
-    df["ema_mid"] = ema(df["close"], ema_mid)
-    df["ema_trend"] = ema(df["close"], ema_trend)
-    df["atr"] = atr_series(df, atr_period)
-    df["atr_avg"] = df["atr"].rolling(max(1, atr_avg_window)).mean()
-    df["avg_vol"] = df["volume"].rolling(max(1, volume_avg_window)).mean()
-    df["rsi"] = rsi(df["close"], rsi_period)
+    df["ema_fast"] = ema(df["close"], cfg.ema_fast)
+    df["ema_mid"] = ema(df["close"], cfg.ema_mid)
+    df["ema_trend"] = ema(df["close"], cfg.ema_trend)
+    df["atr"] = atr_series(df, cfg.atr_period)
+    df["atr_avg"] = df["atr"].rolling(max(1, cfg.atr_avg_window)).mean()
+    df["avg_vol"] = df["volume"].rolling(max(1, cfg.volume_avg_window)).mean()
+    df["rsi"] = rsi(df["close"], cfg.rsi_period)
 
     if len(df) < 3:
         return None
@@ -77,19 +94,9 @@ def evaluate_signal(
     p_ema_fast = float(prev["ema_fast"])
 
     required_values = [
-        s_open,
-        s_close,
-        s_high,
-        s_low,
-        s_vol,
-        s_ema_fast,
-        s_ema_mid,
-        s_ema_trend,
-        s_atr,
-        s_avg_vol,
-        s_rsi,
-        c_close,
-        p_ema_fast,
+        s_open, s_close, s_high, s_low, s_vol,
+        s_ema_fast, s_ema_mid, s_ema_trend,
+        s_atr, s_avg_vol, s_rsi, c_close, p_ema_fast,
     ]
     if any(pd.isna(v) for v in required_values):
         return None
@@ -109,13 +116,13 @@ def evaluate_signal(
         return None
 
     spread_atr = (s_ema_fast - s_ema_mid) / s_atr
-    if spread_atr < min_ema_spread_atr:
+    if spread_atr < cfg.min_ema_spread_atr:
         return None
-    if spread_atr > max_ema_spread_atr:
+    if spread_atr > cfg.max_ema_spread_atr:
         return None
 
     # 2) Pullback near fast EMA.
-    tolerance = pullback_tolerance_atr * s_atr
+    tolerance = cfg.pullback_tolerance_atr * s_atr
     if not (s_low <= s_ema_fast + tolerance and s_low >= s_ema_fast - tolerance):
         return None
 
@@ -126,13 +133,13 @@ def evaluate_signal(
         return None
 
     # 4) Momentum and participation filters.
-    if not (rsi_long_min <= s_rsi <= rsi_long_max):
+    if not (cfg.rsi_long_min <= s_rsi <= cfg.rsi_long_max):
         return None
     upper_third = s_low + (2 / 3) * candle_range
-    if not (body_ratio >= min_body_ratio and s_close > s_open and s_close > upper_third):
+    if not (body_ratio >= cfg.min_body_ratio and s_close > s_open and s_close > upper_third):
         return None
     volume_ratio = s_vol / s_avg_vol
-    if not (volume_min_ratio <= volume_ratio <= volume_max_ratio):
+    if not (cfg.volume_min_ratio <= volume_ratio <= cfg.volume_max_ratio):
         return None
 
     # 5) Confirmation candle breaks signal high.
@@ -141,34 +148,38 @@ def evaluate_signal(
 
     htf_bias = "NEUTRAL"
     htf_penalty = 0.0
-    min_ctx_len = max(ema_mid, ema_trend)
+    min_ctx_len = max(cfg.ema_mid, cfg.ema_trend)
     if not context_df.empty and len(context_df) >= min_ctx_len:
-        ctx_ema_mid = ema(context_df["close"], ema_mid).iloc[-1]
-        ctx_ema_trend = ema(context_df["close"], ema_trend).iloc[-1]
+        ctx_ema_mid = ema(context_df["close"], cfg.ema_mid).iloc[-1]
+        ctx_ema_trend = ema(context_df["close"], cfg.ema_trend).iloc[-1]
         ctx_price = float(context_df["close"].iloc[-1])
         if pd.isna(ctx_ema_mid) or pd.isna(ctx_ema_trend):
-            htf_penalty = context_missing_penalty
+            htf_penalty = cfg.context_missing_penalty
         elif float(ctx_ema_mid) > float(ctx_ema_trend) and ctx_price > float(ctx_ema_mid):
             htf_bias = "LONG"
         else:
             return None
     else:
-        htf_penalty = context_missing_penalty
+        htf_penalty = cfg.context_missing_penalty
 
     stop_price = s_low - (0.1 * s_atr)
     risk_per_unit = entry_price - stop_price
-    if risk_per_unit < (min_risk_atr * s_atr) or risk_per_unit > (max_risk_atr * s_atr):
+    if risk_per_unit < (cfg.min_risk_atr * s_atr) or risk_per_unit > (cfg.max_risk_atr * s_atr):
         return None
-    tp_price = entry_price + (risk_per_unit * rr_target)
+    tp_price = entry_price + (risk_per_unit * cfg.rr_target)
 
     score = round(
-        min(2.0, ((body_ratio - min_body_ratio) / max(1e-9, 1 - min_body_ratio)) * 2)
-        + (1.0 if (rsi_long_min + 5) < s_rsi < (rsi_long_max - 5) else 0.0)
-        + min(1.0, (spread_atr - min_ema_spread_atr) * 2)
+        min(2.0, ((body_ratio - cfg.min_body_ratio) / max(1e-9, 1 - cfg.min_body_ratio)) * 2)
+        + (1.0 if (cfg.rsi_long_min + 5) < s_rsi < (cfg.rsi_long_max - 5) else 0.0)
+        + min(1.0, (spread_atr - cfg.min_ema_spread_atr) * 2)
         - htf_penalty,
         2,
     )
-    if score < min_score:
+    if score < cfg.min_score:
+        return None
+
+    atr_avg_ratio = s_atr / s_avg_atr if s_avg_atr > 0 else 1.0
+    if atr_avg_ratio > cfg.max_atr_avg_ratio:
         return None
 
     ts = conf.get("close_time")
@@ -176,17 +187,13 @@ def evaluate_signal(
         ts.strftime("%Y-%m-%d %H:%M:%S UTC") if isinstance(ts, pd.Timestamp) else str(ts)
     )
 
-    atr_avg_ratio = s_atr / s_avg_atr if s_avg_atr > 0 else 1.0
-    if atr_avg_ratio > max_atr_avg_ratio:
-        return None
-
     return {
         "side": "BUY",
         "price": entry_price,
         "stop_price": stop_price,
         "tp_price": tp_price,
         "risk_per_unit": risk_per_unit,
-        "rr_target": rr_target,
+        "rr_target": cfg.rr_target,
         "atr": float(s_atr),
         "score": score,
         "htf_bias": htf_bias,

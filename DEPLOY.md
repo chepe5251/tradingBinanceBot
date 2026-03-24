@@ -37,14 +37,18 @@ docker compose down
 ## 4. Health expectations
 Typical scheduler/heartbeat log pattern:
 ```text
-INFO | Scheduler init | symbols=300 intervals=['15m', '1h']
-INFO | Scheduler: polling 300 symbols x 2 intervals via REST
+INFO | Loaded 300 symbols by top-volume filter.
+INFO | Scheduler init | symbols=300 intervals=['15m', '1h', '4h']
+INFO | Scheduler: polling 300 symbols x 3 intervals via REST
 INFO | Heartbeat: bot alive | polls=... scheduler=True
 ```
 
-Container healthcheck is based on `logs/.alive`.
+Container healthcheck is based on `logs/.alive` (updated every `LOG_HEARTBEAT_SEC` seconds).
+
+Risk state is persisted to `logs/risk_state.json` and reloaded automatically on restart.
 
 ## 5. Safety
 - Start with `BINANCE_TESTNET=true` first.
 - Use API key IP whitelist.
 - Keep `MAX_POSITIONS` conservative until validated in your environment.
+- `ENABLE_LOSS_SCALING=false` by default — do not enable without backtesting.

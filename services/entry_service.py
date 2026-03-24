@@ -10,8 +10,9 @@ from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 
 from config import Settings
+from exchange_utils import safe_mark_price
 from execution import FuturesExecutor
-from indicators import atr_last, safe_mark_price
+from indicators import atr_last
 from monitor import PositionMonitor
 from risk import RiskManager
 from services.position_service import PositionCache, count_active_positions, get_available_balance

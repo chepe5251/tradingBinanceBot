@@ -52,14 +52,11 @@ from binance import Client
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import from_env  # noqa: E402
 from indicators import atr_series, ema, rsi  # noqa: E402
-from strategy import evaluate_signal  # noqa: E402
+from strategy import StrategyConfig, evaluate_signal  # noqa: E402
 
 # ── configuration ─────────────────────────────────────────────────────────────
 APP_SETTINGS = from_env()
-if APP_SETTINGS.use_top_volume_symbols:
-    TOP_SYMBOLS = APP_SETTINGS.top_volume_symbols_count or APP_SETTINGS.top_symbols_limit
-else:
-    TOP_SYMBOLS = APP_SETTINGS.top_symbols_limit
+TOP_SYMBOLS = APP_SETTINGS.top_volume_symbols_count  # fixed at 300 in config.py
 MAIN_INTERVAL = APP_SETTINGS.main_interval
 CONTEXT_INTERVAL = APP_SETTINGS.context_interval
 HIGHER_INTERVAL = {"15m": "1h", "1h": "4h"}.get(CONTEXT_INTERVAL, "4h")
@@ -81,8 +78,8 @@ LEVERAGE = APP_SETTINGS.leverage
 COMMISSION_PCT = 0.0004   # 0.04 % per side (taker)
 ATR_PERIOD = APP_SETTINGS.atr_period
 
-# evaluate_signal parameters aligned with live settings
-_EVAL_KWARGS: dict = dict(
+# Strategy configuration — mirrors live runtime settings exactly.
+_STRATEGY_CFG = StrategyConfig(
     ema_trend=APP_SETTINGS.ema_trend,
     ema_fast=APP_SETTINGS.ema_fast,
     ema_mid=APP_SETTINGS.ema_mid,
@@ -102,6 +99,7 @@ _EVAL_KWARGS: dict = dict(
     min_risk_atr=APP_SETTINGS.min_risk_atr,
     max_risk_atr=APP_SETTINGS.max_risk_atr,
     min_score=APP_SETTINGS.min_score,
+    max_atr_avg_ratio=APP_SETTINGS.max_atr_avg_ratio,
 )
 MAX_CANDLES_HOLD = 50   # close at market after this many candles
 SKIP_AFTER_SIGNAL = 10  # skip candles after a signal to avoid overlap
@@ -298,7 +296,7 @@ def _simulate_trades(
         else:
             context_sub = pd.DataFrame()
         try:
-            signal = evaluate_signal(sub, context_sub, **_EVAL_KWARGS)
+            signal = evaluate_signal(sub, context_sub, _STRATEGY_CFG)
         except Exception:
             i += 1
             continue

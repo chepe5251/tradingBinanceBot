@@ -168,7 +168,9 @@ class RiskManager:
                 lpu = data.get("loss_pause_until")
                 self.state.loss_pause_until = datetime.fromisoformat(lpu) if lpu else None
         except Exception:
-            pass  # corrupt or unreadable — start with fresh state
+            # Broad catch: JSON may be corrupt, truncated, or from an incompatible schema.
+            # Silently fall back to fresh state rather than aborting startup.
+            pass
 
     def volatility_ok(self, df: pd.DataFrame) -> bool:
         """Check optional single-candle volatility guard."""

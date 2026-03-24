@@ -1,12 +1,13 @@
-"""Shared indicator and market-context helpers used across runtime modules."""
+"""Pure indicator helpers — no exchange or network dependencies.
+
+All functions are stateless transforms over pandas Series/DataFrames.
+Safe to import in tests without mocking Binance.
+"""
 from __future__ import annotations
 
-import logging
 from typing import Optional
 
 import pandas as pd
-from binance import Client
-from binance.exceptions import BinanceAPIException, BinanceRequestException
 
 
 def ema(series: pd.Series, period: int) -> pd.Series:
@@ -70,19 +71,3 @@ def context_slope(df: pd.DataFrame, ema_period: int) -> float:
     if prev == 0.0 or pd.isna(prev) or pd.isna(last):
         return 0.0
     return (last - prev) / prev
-
-
-def safe_mark_price(
-    client: Client,
-    symbol: str,
-    logger: logging.Logger | None = None,
-) -> float | None:
-    """Fetch mark price and return None on recoverable API/network errors."""
-    try:
-        payload = client.futures_mark_price(symbol=symbol)
-        mark = payload.get("markPrice")
-        return float(mark) if mark is not None else None
-    except (BinanceAPIException, BinanceRequestException, OSError, ValueError, TypeError) as exc:
-        if logger is not None:
-            logger.debug("mark_price_failed symbol=%s err=%s", symbol, exc)
-        return None
