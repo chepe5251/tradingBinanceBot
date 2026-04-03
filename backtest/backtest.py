@@ -1,4 +1,4 @@
-"""Backtest — EMA Pullback Long-Only strategy (Binance USDT-M Futures).
+"""Backtest - EMA Pullback Long-Only strategy (Binance USDT-M Futures).
 
 Downloads historical klines from Binance Futures, runs evaluate_signal candle-by-candle
 for M15 / 1H / 4H across the top 300 USDT-M perpetual pairs by volume, simulates trades
@@ -8,7 +8,7 @@ using the exact same filters as the live bot, and saves three CSV files:
   - analysis_YYYYMMDD_HHMMSS.csv   : aggregated stats grouped by interval, score, RSI, etc.
   - equity_YYYYMMDD_HHMMSS.csv     : equity curve with cumulative PnL and drawdown per trade
 
-Architecture — two phases:
+Architecture - two phases:
   Phase 1 (I/O bound)  : ThreadPoolExecutor(60 workers) downloads all klines in parallel.
                          A RateLimiter class enforces the Binance 2300 weight/min budget.
   Phase 2 (CPU bound)  : ProcessPoolExecutor(cpu_count) simulates trades across all cores.
@@ -50,31 +50,50 @@ from datetime import datetime
 import pandas as pd
 from binance import Client
 
-# ── strategy import (one level up) ───────────────────────────────────────────
+# -- strategy import (one level up) --
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import from_env  # noqa: E402
 from indicators import atr_series, ema, rsi  # noqa: E402
+from services.bootstrap_service import ENTRY_CONTEXT_MAP, ENTRY_INTERVALS  # noqa: E402
 from strategy import StrategyConfig, evaluate_signal  # noqa: E402
 
-# ── configuration ─────────────────────────────────────────────────────────────
+# -- configuration --
 APP_SETTINGS = from_env()
-TOP_SYMBOLS = 300
-MAIN_INTERVAL = APP_SETTINGS.main_interval
-CONTEXT_INTERVAL = APP_SETTINGS.context_interval
-HIGHER_INTERVAL = {"15m": "1h", "1h": "4h"}.get(CONTEXT_INTERVAL, "4h")
-DAILY_INTERVAL  = "1d"
-INTERVALS: list[str] = []
-for _interval in [MAIN_INTERVAL, CONTEXT_INTERVAL, HIGHER_INTERVAL, DAILY_INTERVAL]:
-    if _interval and _interval not in INTERVALS:
-        INTERVALS.append(_interval)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name, "")
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name, "")
+    if not value:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+TOP_SYMBOLS = _env_int("BACKTEST_TOP_SYMBOLS", 80)
+# Import the same hierarchy used by the live bot - ensures backtest
+# and production always simulate the exact same intervals and contexts.
+INTERVALS: list[str] = list(ENTRY_INTERVALS)  # ["15m", "1h", "4h", "1d"]
 
 CANDLES_PER_INTERVAL: dict[str, int] = {
-    MAIN_INTERVAL:    max(1500, APP_SETTINGS.history_candles_main),
-    CONTEXT_INTERVAL: max(720, APP_SETTINGS.history_candles_context),
-    DAILY_INTERVAL:   500,   # ~2 years of daily data
+    "15m": _env_int("BACKTEST_CANDLES_15M", 2200),  # fast default profile
+    "1h":  _env_int("BACKTEST_CANDLES_1H", 1400),
+    "4h":  _env_int("BACKTEST_CANDLES_4H", 850),
+    "1d":  _env_int("BACKTEST_CANDLES_1D", 600),
 }
-if HIGHER_INTERVAL not in CANDLES_PER_INTERVAL:
-    CANDLES_PER_INTERVAL[HIGHER_INTERVAL] = max(500, APP_SETTINGS.history_candles_context)
 
 INITIAL_CAPITAL = 500.0
 MARGIN_PER_TRADE = APP_SETTINGS.fixed_margin_per_trade_usdt
@@ -82,7 +101,7 @@ LEVERAGE = APP_SETTINGS.leverage
 COMMISSION_PCT = 0.0004   # 0.04 % per side (taker)
 ATR_PERIOD = APP_SETTINGS.atr_period
 
-# Strategy configuration — mirrors live runtime settings exactly.
+# Strategy configuration - mirrors live runtime settings exactly.
 _STRATEGY_CFG = StrategyConfig(
     ema_trend=APP_SETTINGS.ema_trend,
     ema_fast=APP_SETTINGS.ema_fast,
@@ -107,17 +126,24 @@ _STRATEGY_CFG = StrategyConfig(
 )
 MAX_CANDLES_HOLD = 50   # close at market after this many candles
 SKIP_AFTER_SIGNAL = 10  # skip candles after a signal to avoid overlap
-MAX_DL_WORKERS = 60     # threads para descarga I/O (rate limiter controla la velocidad real)
-SIM_WORKERS    = multiprocessing.cpu_count()  # procesos para simulación CPU-bound
+MAX_DL_WORKERS = _env_int("BACKTEST_DL_WORKERS", 10)  # I/O download threads
+SIM_WORKERS    = _env_int("BACKTEST_SIM_WORKERS", max(1, multiprocessing.cpu_count() - 1))
+RATE_LIMIT_PER_MIN = _env_int("BACKTEST_RATE_LIMIT_PER_MIN", 1200)
+USE_KLINE_CACHE = os.getenv("BACKTEST_USE_CACHE", "1").strip().lower() not in {"0", "false", "no"}
+KLINE_CACHE_MAX_AGE_MIN = _env_int("BACKTEST_CACHE_MAX_AGE_MIN", 180)
+EVAL_WINDOW_ROWS = _env_int("BACKTEST_EVAL_WINDOW_ROWS", max(260, APP_SETTINGS.ema_trend + 30))
+CONTEXT_WINDOW_ROWS = _env_int("BACKTEST_CONTEXT_WINDOW_ROWS", max(260, APP_SETTINGS.ema_trend + 30))
+DOWNLOAD_JITTER_BASE_SEC = _env_float("BACKTEST_DOWNLOAD_JITTER_BASE_SEC", 0.05)
+DOWNLOAD_JITTER_STEP_SEC = _env_float("BACKTEST_DOWNLOAD_JITTER_STEP_SEC", 0.02)
 
 
-# ── rate limiter ─────────────────────────────────────────────────────────────
+# -- rate limiter --
 
 class RateLimiter:
     """Thread-safe rate limiter for Binance API weight budget."""
 
-    def __init__(self, max_weight_per_minute: int = 2300) -> None:
-        # Use 2300 of 2400 available as minimal safety margin
+    def __init__(self, max_weight_per_minute: int = RATE_LIMIT_PER_MIN) -> None:
+        # Configurable budget under Binance 2400/min hard cap.
         self._max = max_weight_per_minute
         self._lock = threading.Lock()
         self._timestamps: list[tuple[float, int]] = []  # (time, weight)
@@ -141,13 +167,85 @@ class RateLimiter:
                 if current_weight + weight <= self._max:
                     self._timestamps.append((now, weight))
                     return
-            time.sleep(0.05)  # Poll cada 50ms — agresivo pero no quema CPU
+            time.sleep(0.05)  # Poll every 50ms - aggressive but low CPU
 
 
-_rate_limiter = RateLimiter()
+_rate_limiter = RateLimiter(RATE_LIMIT_PER_MIN)
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# -- helpers --
+
+def _ban_wait_seconds_from_error(exc: Exception) -> float | None:
+    """Parse Binance ban-until timestamp and return remaining seconds."""
+    match = re.search(r"banned until\s+(\d+)", str(exc))
+    if not match:
+        return None
+    try:
+        ban_until_ms = int(match.group(1))
+    except ValueError:
+        return None
+    remaining = (ban_until_ms / 1000.0) - time.time()
+    return max(0.0, remaining + 1.0)
+
+
+def _sleep_if_banned(exc: Exception, *, max_wait_sec: float = 300.0) -> bool:
+    """Sleep until temporary IP ban expires (capped)."""
+    wait_sec = _ban_wait_seconds_from_error(exc)
+    if wait_sec is None:
+        return False
+    wait_sec = min(wait_sec, max_wait_sec)
+    if wait_sec > 0:
+        print(f"[WARN] Rate-limit ban detected; waiting {wait_sec:.1f}s before retry...")
+        time.sleep(wait_sec)
+    return True
+
+
+def _klines_cache_path(symbol: str, interval: str, limit: int) -> str:
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    safe_symbol = re.sub(r"[^A-Z0-9_]", "_", symbol.upper())
+    safe_interval = re.sub(r"[^A-Z0-9_]", "_", interval.upper())
+    return os.path.join(cache_dir, f"{safe_symbol}_{safe_interval}_{limit}.pkl")
+
+
+def _load_klines_cache(
+    symbol: str,
+    interval: str,
+    limit: int,
+    *,
+    allow_stale: bool = False,
+) -> pd.DataFrame | None:
+    if not USE_KLINE_CACHE:
+        return None
+    path = _klines_cache_path(symbol, interval, limit)
+    if not os.path.exists(path):
+        return None
+    max_age_sec = (KLINE_CACHE_MAX_AGE_MIN * 60) if not allow_stale else 0
+    if max_age_sec > 0:
+        age_sec = time.time() - os.path.getmtime(path)
+        if age_sec > max_age_sec:
+            return None
+    try:
+        cached = pd.read_pickle(path)
+    except Exception:
+        return None
+    if cached.empty:
+        return None
+    required_cols = {"open_time", "open", "high", "low", "close", "volume", "close_time"}
+    if not required_cols.issubset(set(cached.columns)):
+        return None
+    return cached
+
+
+def _save_klines_cache(symbol: str, interval: str, limit: int, df: pd.DataFrame) -> None:
+    if not USE_KLINE_CACHE or df.empty:
+        return
+    path = _klines_cache_path(symbol, interval, limit)
+    try:
+        df.to_pickle(path)
+    except Exception:
+        return
+
 
 def _load_symbols(client: Client) -> list[str]:
     """Return top TOP_SYMBOLS USDT-M perpetual symbols by 24h quote volume."""
@@ -165,11 +263,23 @@ def _load_symbols(client: Client) -> list[str]:
         if TOP_SYMBOLS > 0:
             return configured_symbols[:TOP_SYMBOLS]
         return configured_symbols
-
-    try:
-        info = client.futures_exchange_info()
-    except Exception as exc:
-        print(f"[ERROR] futures_exchange_info: {exc}")
+    info = None
+    for attempt in range(2):
+        try:
+            info = client.futures_exchange_info()
+            break
+        except Exception as exc:
+            print(f"[ERROR] futures_exchange_info: {exc}")
+            if attempt == 0 and _sleep_if_banned(exc):
+                continue
+            fallback_symbols = configured_symbols or [str(APP_SETTINGS.symbol).upper()]
+            fallback_symbols = [s for s in fallback_symbols if symbol_pattern.match(s)]
+            if TOP_SYMBOLS > 0:
+                fallback_symbols = fallback_symbols[:TOP_SYMBOLS]
+            if fallback_symbols:
+                print(f"[WARN] Using configured-symbol fallback: {len(fallback_symbols)}")
+            return fallback_symbols
+    if info is None:
         return []
 
     perp: set[str] = set()
@@ -181,12 +291,23 @@ def _load_symbols(client: Client) -> list[str]:
             and symbol_pattern.match(str(s.get("symbol", "")).upper())
         ):
             perp.add(s["symbol"])
-
-    try:
-        tickers = client.futures_ticker()
-    except Exception as exc:
-        print(f"[ERROR] futures_ticker: {exc}")
+    tickers = None
+    for attempt in range(2):
+        try:
+            tickers = client.futures_ticker()
+            break
+        except Exception as exc:
+            print(f"[ERROR] futures_ticker: {exc}")
+            if attempt == 0 and _sleep_if_banned(exc):
+                continue
+            ranked_fallback = sorted(perp)
+            if not ranked_fallback:
+                ranked_fallback = configured_symbols or [str(APP_SETTINGS.symbol).upper()]
+            return ranked_fallback[:TOP_SYMBOLS] if TOP_SYMBOLS > 0 else ranked_fallback
+    if tickers is None:
         ranked_fallback = sorted(perp)
+        if not ranked_fallback:
+            ranked_fallback = configured_symbols or [str(APP_SETTINGS.symbol).upper()]
         return ranked_fallback[:TOP_SYMBOLS] if TOP_SYMBOLS > 0 else ranked_fallback
 
     vol_map: dict[str, float] = {}
@@ -222,35 +343,74 @@ def _load_symbols(client: Client) -> list[str]:
 
 
 def _fetch_klines(client: Client, symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    """Download klines and return a clean DataFrame."""
-    max_retries = 3
-    klines = None
-    _rate_limiter.acquire(limit)
-    for attempt in range(max_retries):
-        try:
-            klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    """Download klines with automatic pagination for limits > 1500."""
+    cached = _load_klines_cache(symbol, interval, limit)
+    if cached is not None:
+        return cached
+
+    MAX_PER_REQUEST = 1500
+    all_rows: list[dict] = []
+    remaining = limit
+    end_time: int | None = None
+    max_retries = 4
+
+    while remaining > 0:
+        fetch_limit = min(remaining, MAX_PER_REQUEST)
+        # Small jitter to spread burst across workers.
+        time.sleep(DOWNLOAD_JITTER_BASE_SEC + (hash((symbol, interval, remaining)) % 5) * DOWNLOAD_JITTER_STEP_SEC)
+        _rate_limiter.acquire(fetch_limit)
+        klines = None
+        delay = 1.0
+        for attempt in range(max_retries):
+            try:
+                kwargs: dict = dict(symbol=symbol, interval=interval, limit=fetch_limit)
+                if end_time is not None:
+                    kwargs["endTime"] = end_time
+                klines = client.futures_klines(**kwargs)
+                break
+            except Exception as exc:
+                if _sleep_if_banned(exc, max_wait_sec=600.0):
+                    delay = min(delay * 1.5, 10.0)
+                    continue
+                if attempt < max_retries - 1:
+                    print(f"  [RETRY {attempt+1}/{max_retries}] {symbol} {interval}: waiting {delay}s...")
+                    time.sleep(delay)
+                    delay = min(delay * 2.0, 10.0)
+                else:
+                    raise exc
+
+        if not klines:
             break
-        except Exception as e:
-            if attempt < max_retries - 1:
-                print(f"  [RETRY {attempt+1}/{max_retries}] {symbol} {interval}: esperando 1s...")
-                time.sleep(1)
-            else:
-                raise e
-    rows = [
-        {
-            "open_time": int(k[0]),
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": float(k[5]),
-            "close_time": int(k[6]),
-        }
-        for k in klines
-    ]
-    df = pd.DataFrame(rows)
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+
+        rows = [
+            {
+                "open_time":  int(k[0]),
+                "open":       float(k[1]),
+                "high":       float(k[2]),
+                "low":        float(k[3]),
+                "close":      float(k[4]),
+                "volume":     float(k[5]),
+                "close_time": int(k[6]),
+            }
+            for k in klines
+        ]
+        all_rows = rows + all_rows  # prepend - keeps chronological order
+        remaining -= len(klines)
+
+        if len(klines) < fetch_limit:
+            break  # Binance returned fewer rows - no more history available
+
+        end_time = int(klines[0][0]) - 1  # next page ends before the first candle in this batch
+
+    if not all_rows:
+        stale = _load_klines_cache(symbol, interval, limit, allow_stale=True)
+        return stale if stale is not None else pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    df = df.drop_duplicates(subset=["open_time"]).sort_values("open_time").reset_index(drop=True)
+    df["open_time"]  = pd.to_datetime(df["open_time"],  unit="ms", utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    _save_klines_cache(symbol, interval, limit, df)
     return df
 
 
@@ -261,7 +421,7 @@ def _fmt_ts(ts) -> str:
     return str(ts)
 
 
-# ── local indicator helpers (for extra CSV fields) ────────────────────────────
+# -- local indicator helpers (for extra CSV fields) --
 
 def _ema_col(series: pd.Series, period: int) -> pd.Series:
     return ema(series, period)
@@ -275,7 +435,7 @@ def _rsi_col(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi(series, period)
 
 
-# ── simulation ────────────────────────────────────────────────────────────────
+# -- simulation --
 
 def _simulate_trades(
     df: pd.DataFrame,
@@ -287,13 +447,22 @@ def _simulate_trades(
 
     Returns (trades, skipped_4h_sell, skipped_low_score, rejects, diagnostics).
     """
-    # Precompute indicators once for extra CSV fields
+    # Precompute indicators once for extra CSV fields and signal evaluation reuse.
     ema20   = _ema_col(df["close"], APP_SETTINGS.ema_fast)
     ema50   = _ema_col(df["close"], APP_SETTINGS.ema_mid)
     ema200  = _ema_col(df["close"], APP_SETTINGS.ema_trend)
     atr     = _atr_col(df, ATR_PERIOD)
+    atr_avg = atr.rolling(APP_SETTINGS.atr_avg_window).mean()
     avg_vol = df["volume"].rolling(APP_SETTINGS.volume_avg_window).mean()
     rsi     = _rsi_col(df["close"], APP_SETTINGS.rsi_period)
+    df = df.copy()
+    df["ema_fast"] = ema20
+    df["ema_mid"] = ema50
+    df["ema_trend"] = ema200
+    df["atr"] = atr
+    df["atr_avg"] = atr_avg
+    df["avg_vol"] = avg_vol
+    df["rsi"] = rsi
 
     trades: list[dict] = []
     rejects: dict[str, int] = {}
@@ -302,18 +471,43 @@ def _simulate_trades(
     skipped_low_score = 0
     i = min(230, max(20, len(df) // 2))  # warm-up: use half the data or 230, min 20
     n = len(df)
+    high_arr = df["high"].to_numpy()
+    low_arr = df["low"].to_numpy()
+    open_arr = df["open"].to_numpy()
+    close_arr = df["close"].to_numpy()
+    vol_arr = df["volume"].to_numpy()
+    close_time_arr = df["close_time"].to_numpy()
+    close_time_ns = df["close_time"].astype("int64").to_numpy()
+    close_index_by_ns = {int(ts): idx for idx, ts in enumerate(close_time_ns)}
+    empty_context = pd.DataFrame()
+    context_sub = empty_context
+    prev_ctx_pos = -1
+    has_context = context_df is not None and not context_df.empty
+    context_close_ns = None
+    if has_context:
+        context_df = context_df.copy()
+        if "ema_mid" not in context_df.columns:
+            context_df["ema_mid"] = ema(context_df["close"], APP_SETTINGS.ema_mid)
+        if "ema_trend" not in context_df.columns:
+            context_df["ema_trend"] = ema(context_df["close"], APP_SETTINGS.ema_trend)
+        context_close_ns = context_df["close_time"].astype("int64").to_numpy()
 
     def _safe(series: pd.Series, idx: int) -> float:
         v = series.iloc[idx]
         return float(v) if not pd.isna(v) else 0.0
 
     while i < n - 1:
-        sub = df.iloc[: i + 1]
-        if context_df is not None and not context_df.empty:
-            cutoff = sub.iloc[-1]["close_time"]
-            context_sub = context_df.loc[context_df["close_time"] <= cutoff]
+        sub_start = max(0, i - EVAL_WINDOW_ROWS + 1)
+        sub = df.iloc[sub_start : i + 1]
+        if has_context and context_close_ns is not None:
+            cutoff_ns = int(close_time_ns[i])
+            ctx_pos = int(context_close_ns.searchsorted(cutoff_ns, side="right"))
+            if ctx_pos != prev_ctx_pos:
+                ctx_start = max(0, ctx_pos - CONTEXT_WINDOW_ROWS)
+                context_sub = context_df.iloc[ctx_start:ctx_pos] if ctx_pos > 0 else context_df.iloc[:0]
+                prev_ctx_pos = ctx_pos
         else:
-            context_sub = pd.DataFrame()
+            context_sub = empty_context
         diagnostics["eval_calls"] += 1
         try:
             signal = evaluate_signal(
@@ -334,7 +528,7 @@ def _simulate_trades(
         diagnostics["signals"] += 1
 
         # Mirror production filters exactly
-        if interval == HIGHER_INTERVAL and signal.get("side") == "SELL":
+        if interval in APP_SETTINGS.block_sell_on_intervals and signal.get("side") == "SELL":
             skipped_4h_sell += 1
             i += 1
             continue
@@ -355,10 +549,34 @@ def _simulate_trades(
             continue
 
         # entry_time: close_time of confirmation candle (df.iloc[i])
-        entry_time = _fmt_ts(df.iloc[i]["close_time"])
+        entry_time = _fmt_ts(close_time_arr[i])
 
-        # ── extra fields from precomputed indicators ──────────────────────────
-        sig_idx = i - 1  # signal candle = sub.iloc[-2] = df.iloc[i-1]
+        # -- extra fields from precomputed indicators --
+        # Determine setup candle index for CSV metadata.
+        strategy_name = signal.get("strategy", "ema_pullback_long")
+        sig_idx = i - 1  # default: confirmation-based entry (EMA pullback and NR4)
+        if strategy_name == "bos_retest_4h":
+            breakout_raw = signal.get("breakout_time")
+            if breakout_raw:
+                breakout_ts = pd.to_datetime(str(breakout_raw), utc=True, errors="coerce")
+                if not pd.isna(breakout_ts):
+                    breakout_ns = int(breakout_ts.value)
+                    mapped_idx = close_index_by_ns.get(breakout_ns)
+                    if mapped_idx is not None:
+                        sig_idx = int(mapped_idx)
+                    else:
+                        # Fallback to nearest candle around the entry window.
+                        w_start = max(0, i - 8)
+                        w_ns = close_time_ns[w_start : i + 1]
+                        if len(w_ns) > 0:
+                            nearest_local = int((abs(w_ns - breakout_ns)).argmin())
+                            nearest_abs = w_start + nearest_local
+                            if abs(int(close_time_ns[nearest_abs]) - breakout_ns) <= int(pd.Timedelta(hours=8).value):
+                                sig_idx = nearest_abs
+        elif strategy_name == "nr4_breakout_1d":
+            sig_idx = i - 1  # signal candle is the breakout candle
+        if sig_idx < 0 or sig_idx >= len(df):
+            sig_idx = max(0, i - 1)
 
         e20     = _safe(ema20,   sig_idx)
         e50     = _safe(ema50,   sig_idx)
@@ -367,12 +585,11 @@ def _simulate_trades(
         avv_sig = _safe(avg_vol, sig_idx)
         rsi_sig = _safe(rsi,     sig_idx)
 
-        sig_row = df.iloc[sig_idx]
-        s_high  = float(sig_row["high"])
-        s_low   = float(sig_row["low"])
-        s_open  = float(sig_row["open"])
-        s_close = float(sig_row["close"])
-        s_vol   = float(sig_row["volume"])
+        s_high  = float(high_arr[sig_idx])
+        s_low   = float(low_arr[sig_idx])
+        s_open  = float(open_arr[sig_idx])
+        s_close = float(close_arr[sig_idx])
+        s_vol   = float(vol_arr[sig_idx])
 
         rng        = s_high - s_low
         body       = abs(s_close - s_open)
@@ -396,15 +613,14 @@ def _simulate_trades(
         # Simulate: scan next candles for SL/TP hit
         result     = "TIMEOUT"
         timeout_j  = min(i + MAX_CANDLES_HOLD, n - 1)
-        exit_price = float(df.iloc[timeout_j]["close"])
+        exit_price = float(close_arr[timeout_j])
         exit_j     = timeout_j
         candles_held = 0
 
         for j in range(i + 1, min(i + MAX_CANDLES_HOLD + 1, n)):
-            candle = df.iloc[j]
             candles_held = j - i
-            c_high = float(candle["high"])
-            c_low  = float(candle["low"])
+            c_high = float(high_arr[j])
+            c_low  = float(low_arr[j])
 
             if side == "BUY":
                 if c_high >= tp_price and c_low <= stop_price:
@@ -439,7 +655,7 @@ def _simulate_trades(
                     exit_j = j
                     break
 
-        exit_time = _fmt_ts(df.iloc[exit_j]["close_time"])
+        exit_time = _fmt_ts(close_time_arr[exit_j])
 
         if side == "BUY":
             gross_pnl = (exit_price - entry_price) * qty
@@ -478,7 +694,7 @@ def _simulate_trades(
     return trades, skipped_4h_sell, skipped_low_score, rejects, diagnostics
 
 
-# ── stats helpers ─────────────────────────────────────────────────────────────
+# -- stats helpers --
 
 def _compute_stats(trades: list[dict]) -> dict:
     """Return aggregated statistics for a list of trades."""
@@ -639,7 +855,7 @@ def _group_by(trades: list[dict], key_fn) -> dict[str, list[dict]]:
     return groups
 
 
-# ── CSV output ────────────────────────────────────────────────────────────────
+# -- CSV output --
 
 def _save_csv(all_trades: list[dict], ts: str) -> str:
     results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
@@ -761,7 +977,7 @@ def _save_equity_csv(all_trades: list[dict], ts: str) -> str:
     return path
 
 
-# ── console report ────────────────────────────────────────────────────────────
+# -- console report --
 
 def _print_report(
     all_trades: list[dict],
@@ -794,11 +1010,11 @@ def _print_report(
                 f"PnL: {_usd(s['total_pnl'])}"
             )
 
-    # ── Section 1: General summary ────────────────────────────────────────────
-    _section("1. RESUMEN GENERAL")
+    # -- Section 1: General summary --
+    _section("1. OVERALL SUMMARY")
     g = _compute_stats(all_trades)
     if g["total"] == 0:
-        print("  Sin trades.")
+        print("  No trades.")
     else:
         be_wr = 1 / (1 + g["rr_real"]) * 100 if g["rr_real"] > 0 else 0.0
         print(f"  Total trades   : {g['total']}")
@@ -816,57 +1032,57 @@ def _print_report(
         print(f"  Profit Factor  : {g['profit_factor']:.2f}")
         print(f"  WR breakeven   : {be_wr:.1f}%")
 
-    # ── Section 2: By timeframe + side ───────────────────────────────────────
-    _section("2. POR TIMEFRAME Y SIDE")
+    # -- Section 2: By timeframe + side --
+    _section("2. BY TIMEFRAME AND SIDE")
     tf_side = _group_by(all_trades, lambda t: f"{t['interval']} {t['side']}")
     order2 = ["15m BUY", "15m SELL", "1h BUY", "1h SELL", "4h BUY", "4h SELL"]
     _print_group(tf_side, order2)
 
-    # ── Section 3: By score range ─────────────────────────────────────────────
-    _section("3. POR SCORE")
+    # -- Section 3: By score range --
+    _section("3. BY SCORE")
     _print_group(_group_by(all_trades, _score_range), ["0-1", "1-2", "2-3", "3-4", "4+"])
 
-    # ── Section 4: By candles held ────────────────────────────────────────────
-    _section("4. POR DURACION (candles held)")
+    # -- Section 4: By candles held --
+    _section("4. BY DURATION (candles held)")
     _print_group(_group_by(all_trades, _hold_range), ["0-5", "5-10", "10-20", "20-35", "35+"])
 
-    # ── Section 5: By market phase ────────────────────────────────────────────
-    _section("5. POR MARKET PHASE")
+    # -- Section 5: By market phase --
+    _section("5. BY MARKET PHASE")
     _print_group(_group_by(all_trades, lambda t: str(t.get("market_phase", "MIXED"))),
                  ["UPTREND", "DOWNTREND", "MIXED"])
 
-    # ── Section 6: By vol_ratio ───────────────────────────────────────────────
-    _section("6. POR VOLUMEN (vol_ratio)")
+    # -- Section 6: By vol_ratio --
+    _section("6. BY VOLUME (vol_ratio)")
     _print_group(_group_by(all_trades, _vol_range), ["<1.5", "1.5-2.0", "2.0-3.0", ">3.0"])
 
-    # ── Section 7: By RSI ─────────────────────────────────────────────────────
-    _section("7. POR RSI EN SEÑAL")
+    # -- Section 7: By RSI --
+    _section("7. BY RSI AT SIGNAL")
     _print_group(_group_by(all_trades, _rsi_range),
                  ["<48", "48-52", "52-56", "56-60", "60-64", "64-68", ">=68"])
 
-    # ── Section 8: Top 5 best / worst symbols ────────────────────────────────
-    _section("8. TOP 5 MEJORES Y PEORES PARES")
+    # -- Section 8: Top 5 best / worst symbols --
+    _section("8. TOP 5 BEST AND WORST PAIRS")
     sym_groups = _group_by(all_trades, lambda t: t["symbol"])
     sym_stats  = {sym: _compute_stats(ts) for sym, ts in sym_groups.items()}
     by_pnl     = sorted(sym_stats.items(), key=lambda x: x[1]["total_pnl"], reverse=True)
 
-    print("  MEJORES:")
+    print("  BEST:")
     for sym, s in by_pnl[:5]:
         print(f"    {sym:<15} | {s['total']:>4} trades | WR: {s['winrate']:>5.1f}% | "
               f"PF: {s['profit_factor']:>4.2f} | PnL: {_usd(s['total_pnl'])}")
 
-    print("  PEORES:")
+    print("  WORST:")
     for sym, s in by_pnl[-5:]:
         print(f"    {sym:<15} | {s['total']:>4} trades | WR: {s['winrate']:>5.1f}% | "
               f"PF: {s['profit_factor']:>4.2f} | PnL: {_usd(s['total_pnl'])}")
 
-    # ── Section 9: Discarded trades ───────────────────────────────────────────
-    _section("9. TRADES DESCARTADOS")
-    print(f"  4H SELL filtrados  : {skipped_4h_sell}")
+    # -- Section 9: Discarded trades --
+    _section("9. FILTERED TRADES")
+    print(f"  4H SELL filtered   : {skipped_4h_sell}")
     print(f"  Score < 1.0        : {skipped_low_score}")
 
-    # ── Section 10: Equity curve y drawdown ──────────────────────────────────
-    _section("10. EQUITY CURVE Y DRAWDOWN")
+    # -- Section 10: Equity curve and drawdown --
+    _section("10. EQUITY CURVE AND DRAWDOWN")
     if all_trades:
         cum_pnl    = 0.0
         peak       = 0.0
@@ -907,14 +1123,14 @@ def _print_report(
 
         print(f"  Max drawdown (USDT)  : {_usd(max_dd)}")
         print(f"  Max drawdown (%)     : {max_dd_pct:.2f}%")
-        print(f"  Drawdown en          : {max_dd_time}")
-        print(f"  Recuperado           : {'Sí' if recovered else 'No (abierto al final)'}")
+        print(f"  Drawdown at          : {max_dd_time}")
+        print(f"  Recovered            : {'Yes' if recovered else 'No (still open at end)'}")
         print(f"  Calmar ratio         : {calmar:.2f}")
         print(f"  Max cons. wins       : {max_cons_wins}")
         print(f"  Max cons. losses     : {max_cons_losses}")
 
-    # ── Section 11: Frecuencia de trades ─────────────────────────────────────
-    _section("11. FRECUENCIA DE TRADES")
+    # -- Section 11: Trade frequency --
+    _section("11. TRADE FREQUENCY")
     if all_trades:
         days_count: dict[str, int] = {}
         days_by_interval: dict[str, dict[str, int]] = {iv: {} for iv in INTERVALS}
@@ -934,20 +1150,20 @@ def _print_report(
             avg_trades = sum(counts) / n_days
             med_idx    = n_days // 2
             med_trades = counts[med_idx]
-            print(f"  Días con actividad   : {n_days}")
-            print(f"  Trades/día promedio  : {avg_trades:.1f}")
-            print(f"  Trades/día mediano   : {med_trades}")
-            print(f"  Trades/día mínimo    : {counts[0]}")
-            print(f"  Trades/día máximo    : {counts[-1]}")
+            print(f"  Active days          : {n_days}")
+            print(f"  Avg trades/day       : {avg_trades:.1f}")
+            print(f"  Median trades/day    : {med_trades}")
+            print(f"  Min trades/day       : {counts[0]}")
+            print(f"  Max trades/day       : {counts[-1]}")
             print()
             for iv in INTERVALS:
                 iv_counts = sorted(days_by_interval[iv].values())
                 if iv_counts:
                     avg_iv = sum(iv_counts) / len(iv_counts)
-                    print(f"  {iv} -> {avg_iv:.1f} trades/día promedio ({len(iv_counts)} días activos)")
+                    print(f"  {iv} -> {avg_iv:.1f} avg trades/day ({len(iv_counts)} active days)")
 
-    # ── Section 12: Top-winner concentration ─────────────────────────────────
-    _section("12. CONCENTRACIÓN DE TOP WINNERS")
+    # -- Section 12: Top-winner concentration --
+    _section("12. TOP WINNER CONCENTRATION")
     if all_trades:
         total_pnl_all = sum(t["pnl_usdt"] for t in all_trades)
         sorted_by_pnl = sorted(all_trades, key=lambda t: t["pnl_usdt"], reverse=True)
@@ -964,18 +1180,18 @@ def _print_report(
                 f"Exp {rest_s['expectancy']:>+.3f}"
             )
         print()
-        print("  Interpretación: si los top-5 concentran >70% del PnL,")
-        print("  la ventaja estadística puede ser frágil (dependencia de outliers).")
+        print("  Interpretation: if top-5 trades concentrate >70% of PnL,")
+        print("  statistical edge may be fragile (outlier dependency).")
 
-    # ── Section 13: Files generated ───────────────────────────────────────────
-    _section("13. ARCHIVOS GENERADOS")
+    # -- Section 13: Files generated --
+    _section("13. GENERATED FILES")
     print(f"  Trades CSV   : {csv_path}")
     print(f"  Analysis CSV : {analysis_path}")
     print(f"  Equity CSV   : {equity_path}")
     print()
 
 
-# ── parallel worker ───────────────────────────────────────────────────────────
+# -- parallel worker --
 
 _thread_local = threading.local()
 
@@ -995,13 +1211,16 @@ def _download_one(args: tuple) -> tuple[str, str, pd.DataFrame | None, str | Non
     try:
         df = _fetch_klines(client, sym, interval, limit)
         if len(df) < 10:
-            return sym, interval, None, f"datos insuficientes ({len(df)} velas)"
+            return sym, interval, None, f"insufficient data ({len(df)} candles)"
         return sym, interval, df, None
     except Exception as exc:
+        stale = _load_klines_cache(sym, interval, limit, allow_stale=True)
+        if stale is not None and len(stale) >= 10:
+            return sym, interval, stale, None
         return sym, interval, None, f"error: {exc}"
 
 
-# ── simulation task (top-level for pickle / ProcessPoolExecutor) ──────────────
+# -- simulation task (top-level for pickle / ProcessPoolExecutor) --
 
 def _simulate_task(args: tuple) -> tuple[str, str, list[dict], int, int, dict[str, int], dict[str, int]]:
     """Pickleable wrapper for ProcessPoolExecutor - Phase 2."""
@@ -1020,7 +1239,7 @@ def _simulate_task(args: tuple) -> tuple[str, str, list[dict], int, int, dict[st
     return sym, interval, trades, s4h, ssc, rejects, diagnostics
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+# -- main --
 
 def main() -> None:
     api_key = os.getenv("BINANCE_API_KEY", "")
@@ -1028,12 +1247,12 @@ def main() -> None:
 
     client = Client(api_key, api_secret)
 
-    print("Cargando símbolos...")
+    print("Loading symbols...")
     symbols = _load_symbols(client)
     if not symbols:
-        print("[ERROR] No se pudieron cargar los símbolos.")
+        print("[ERROR] Could not load symbols.")
         return
-    print(f"Símbolos seleccionados: {len(symbols)}")
+    print(f"Selected symbols: {len(symbols)}")
 
     download_tasks = [
         (sym, interval, api_key, api_secret)
@@ -1041,8 +1260,8 @@ def main() -> None:
     ]
     total_dl = len(download_tasks)
 
-    # ── Fase 1: Descarga paralela ─────────────────────────────────────────────
-    print(f"\nFase 1: Descargando {total_dl} datasets con {MAX_DL_WORKERS} workers...")
+    # Phase 1: Parallel download
+    print(f"\nPhase 1: Downloading {total_dl} datasets with {MAX_DL_WORKERS} workers...")
     kline_data: dict[tuple[str, str], pd.DataFrame] = {}
     dl_done = 0
     dl_errors = 0
@@ -1061,15 +1280,15 @@ def main() -> None:
                 elapsed   = time.time() - t0
                 rate      = dl_done / elapsed if elapsed > 0 else 1
                 remaining = (total_dl - dl_done) / rate if rate > 0 else 0
-                print(f"  Descargados: {dl_done}/{total_dl} | "
-                      f"{elapsed:.0f}s transcurridos | ~{remaining:.0f}s restantes | "
-                      f"{dl_errors} errores")
+                print(f"  Downloaded: {dl_done}/{total_dl} | "
+                      f"{elapsed:.0f}s elapsed | ~{remaining:.0f}s remaining | "
+                      f"{dl_errors} errors")
 
     _dl_end = time.time()
-    print(f"Fase 1 completa: {len(kline_data)} datasets OK, {dl_errors} errores "
-          f"en {_dl_end - t0:.0f}s")
+    print(f"Phase 1 complete: {len(kline_data)} datasets OK, {dl_errors} errors "
+          f"in {_dl_end - t0:.0f}s")
 
-    # ── Fase 2: Simulación paralela (CPU-bound → ProcessPoolExecutor) ─────────
+    # Phase 2: Parallel simulation (CPU-bound -> ProcessPoolExecutor)
     all_trades: list[dict] = []
     total_skipped_4h_sell   = 0
     total_skipped_low_score = 0
@@ -1082,16 +1301,12 @@ def main() -> None:
     sim_done  = 0
 
     print(f"\n{'=' * 60}")
-    print("  FASE 2: SIMULACIÓN DE TRADES")
+    print("  PHASE 2: TRADE SIMULATION")
     print(f"{'=' * 60}")
-    print(f"  Usando {SIM_WORKERS} procesos paralelos")
+    print(f"  Using {SIM_WORKERS} parallel processes")
 
-    # Serializar DataFrames a dicts para pickle eficiente
-    context_by_interval: dict[str, str] = {MAIN_INTERVAL: CONTEXT_INTERVAL}
-    if CONTEXT_INTERVAL != HIGHER_INTERVAL:
-        context_by_interval[CONTEXT_INTERVAL] = HIGHER_INTERVAL
-    # 1D uses 4H (HIGHER_INTERVAL) as its higher-timeframe context.
-    context_by_interval[DAILY_INTERVAL] = HIGHER_INTERVAL
+    # Serialize DataFrames to dicts for efficient pickling
+    context_by_interval: dict[str, str] = ENTRY_CONTEXT_MAP
 
     sim_args = []
     for (sym, interval), df in kline_data.items():
@@ -1110,7 +1325,7 @@ def main() -> None:
                 context_dict = context_send.to_dict("list")
 
         sim_args.append((df_send.to_dict("list"), context_dict, sym, interval))
-    del kline_data  # liberar memoria
+    del kline_data  # free memory
 
     t1 = time.time()
     with ProcessPoolExecutor(max_workers=SIM_WORKERS) as executor:
@@ -1137,49 +1352,72 @@ def main() -> None:
                 elapsed   = time.time() - t1
                 rate      = sim_done / elapsed if elapsed > 0 else 1
                 remaining = (total_sim - sim_done) / rate if rate > 0 else 0
-                print(f"  Simulados: {sim_done}/{total_sim} | "
-                      f"{elapsed:.0f}s | ~{remaining:.0f}s restantes")
+                print(f"  Simulated: {sim_done}/{total_sim} | "
+                      f"{elapsed:.0f}s | ~{remaining:.0f}s remaining")
 
-    del sim_args  # liberar memoria
+    del sim_args  # free memory
 
     _total = time.time() - t0
     print(f"\n{'=' * 60}")
-    print("  RESUMEN DE EJECUCIÓN")
+    print("  EXECUTION SUMMARY")
     print(f"{'=' * 60}")
-    print(f"  Descarga:   {_dl_end - t0:.0f}s")
-    print(f"  Simulación: {time.time() - t1:.0f}s")
+    print(f"  Download:   {_dl_end - t0:.0f}s")
+    print(f"  Simulation: {time.time() - t1:.0f}s")
     print(f"  TOTAL:      {_total:.0f}s ({_total / 60:.1f} min)")
-    print(f"  evaluate_signal llamadas: {eval_calls_total}")
-    print(f"  SeÃ±ales emitidas (pre-trade): {eval_signals_total}")
-    print(f"  Excepciones en evaluate_signal: {eval_exceptions_total}")
-    print(f"  Trades generados: {len(all_trades)}")
+    print(f"  evaluate_signal calls: {eval_calls_total}")
+    print(f"  Signals emitted (pre-trade): {eval_signals_total}")
+    print(f"  Exceptions in evaluate_signal: {eval_exceptions_total}")
+    print(f"  Trades generated: {len(all_trades)}")
 
     reject_keys = [
         "reject_trend",
         "reject_spread_min",
         "reject_spread_max",
+        "reject_spread_dead_zone",
         "reject_pullback",
         "reject_structure",
         "reject_rsi",
         "reject_body",
         "reject_volume",
+        "reject_volume_extreme",
         "reject_confirmation",
         "reject_extension",
+        "reject_bos_trend",
+        "reject_bos_missing",
+        "reject_bos_volume",
+        "reject_bos_retest_zone",
+        "reject_bos_retest_body",
+        "reject_bos_retest_rsi",
+        "reject_bos_atr_spike",
+        "reject_bos_risk",
+        "reject_bos_score",
+        "reject_bos_htf",
+        "reject_nr4_trend",
+        "reject_nr4_compression",
+        "reject_nr4_breakout",
+        "reject_nr4_signal_body",
+        "reject_nr4_signal_volume",
+        "reject_nr4_signal_rsi",
+        "reject_nr4_confirmation",
+        "reject_nr4_htf",
+        "reject_nr4_risk",
+        "reject_nr4_score",
+        "reject_nr4_atr_spike",
         "reject_htf",
         "reject_risk",
         "reject_score",
         "reject_atr_spike",
     ]
     print(f"\n{'=' * 60}")
-    print("  DIAGNOSTICO DE FILTROS (reject_*)")
+    print("  FILTER DIAGNOSTIC (reject_*)")
     print(f"{'=' * 60}")
     total_rejects = sum(reject_totals.values())
-    print(f"  Total rechazos contabilizados: {total_rejects}")
+    print(f"  Total rejects counted: {total_rejects}")
     for key in reject_keys:
         print(f"  {key:<24}: {reject_totals.get(key, 0)}")
 
     print(f"\n{'=' * 60}")
-    print("  RECHAZOS POR INTERVALO")
+    print("  REJECTS BY INTERVAL")
     print(f"{'=' * 60}")
     for iv in INTERVALS:
         iv_counts = reject_by_interval.get(iv, {})
@@ -1191,9 +1429,9 @@ def main() -> None:
                 print(f"    {key}: {value}")
 
     if not all_trades:
-        print("\n[WARN] No se generaron trades; revisar el diagnÃ³stico de filtros arriba.")
+        print("\n[WARN] No trades were generated; review the filter diagnostic above.")
 
-    # Sort chronologically before saving — ensures equity curve is meaningful
+    # Sort chronologically before saving - ensures equity curve is meaningful
     all_trades.sort(key=lambda t: t.get("entry_time", ""))
 
     # Shared timestamp for all output files
