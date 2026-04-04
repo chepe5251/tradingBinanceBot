@@ -93,6 +93,9 @@ def _evaluate_bos_4h(
     c_low = float(current["low"])
     c_close = float(current["close"])
     c_vol = float(current["volume"])
+    c_ema_fast = float(current["ema_fast"])
+    c_ema_mid = float(current["ema_mid"])
+    c_ema_trend = float(current["ema_trend"])
     c_atr = float(current["atr"])
     c_atr_avg = float(current["atr_avg"])
     c_avg_vol = float(current["avg_vol"])
@@ -101,7 +104,7 @@ def _evaluate_bos_4h(
         return None
 
     current_idx = len(df) - 1
-    bos_start = max(2, current_idx - 5)
+    bos_start = max(2, current_idx - 10)
     bos_end = current_idx - 1
     if bos_end < bos_start:
         _bump_reject(rejects, "reject_bos_missing")
@@ -125,6 +128,7 @@ def _evaluate_bos_4h(
             float(bos["ema_fast"]),
             float(bos["ema_mid"]),
             float(bos["ema_trend"]),
+            float(bos["atr"]),
             float(bos["avg_vol"]),
         ]
         if any(pd.isna(v) for v in required_bos):
@@ -139,8 +143,9 @@ def _evaluate_bos_4h(
         b_ema_fast = float(bos["ema_fast"])
         b_ema_mid = float(bos["ema_mid"])
         b_ema_trend = float(bos["ema_trend"])
+        b_atr = float(bos["atr"])
         b_range = b_high - b_low
-        if b_range <= 0 or b_avg_vol <= 0:
+        if b_range <= 0 or b_avg_vol <= 0 or b_atr <= 0:
             continue
 
         # Swing high is the highest high in a simple 10-30 candle lookback,
@@ -161,13 +166,17 @@ def _evaluate_bos_4h(
             continue
 
         b_vol_ratio = b_vol / b_avg_vol
-        if b_vol_ratio <= 1.2:
+        if b_vol_ratio < 1.20:
             saw_bos_volume_fail = True
+            continue
+
+        b_body_ratio = abs(b_close - b_open) / b_range
+        if b_body_ratio < 0.35:
             continue
 
         bos_idx = idx
         swing_high = swing_candidate
-        bos_body_ratio = abs(b_close - b_open) / b_range
+        bos_body_ratio = b_body_ratio
         bos_vol_ratio = b_vol_ratio
         break
 
@@ -180,15 +189,18 @@ def _evaluate_bos_4h(
             _bump_reject(rejects, "reject_bos_missing")
         return None
 
-    retest_min = swing_high - (0.3 * c_atr)
-    retest_max = swing_high + (0.5 * c_atr)
+    retest_min = swing_high - (0.35 * c_atr)
+    retest_max = swing_high + (0.50 * c_atr)
     if not (retest_min <= c_low <= retest_max):
         _bump_reject(rejects, "reject_bos_retest_zone")
         return None
-    if c_close <= c_open:
+    if c_close <= c_open or c_close < (swing_high - 0.05 * c_atr):
         _bump_reject(rejects, "reject_bos_retest_body")
         return None
-    if not (45.0 <= c_rsi <= 65.0):
+    if not (c_ema_fast > c_ema_mid and c_ema_mid >= c_ema_trend):
+        _bump_reject(rejects, "reject_bos_structure")
+        return None
+    if not (45.0 <= c_rsi <= 63.0):
         _bump_reject(rejects, "reject_bos_retest_rsi")
         return None
 
@@ -209,21 +221,37 @@ def _evaluate_bos_4h(
         ctx_price = float(context_df["close"].iloc[-1])
         if not (pd.isna(ctx_ema_mid) or pd.isna(ctx_ema_trend)):
             if not (float(ctx_ema_mid) > float(ctx_ema_trend) and ctx_price > float(ctx_ema_mid)):
-                _bump_reject(rejects, "reject_bos_htf")
-                return None
+                strong_bos = (
+                    bos_body_ratio >= 0.60
+                    and bos_vol_ratio >= 1.40
+                    and 50.0 <= c_rsi <= 60.0
+                )
+                if strong_bos:
+                    htf_bias = "NEUTRAL"
+                else:
+                    _bump_reject(rejects, "reject_bos_htf")
+                    return None
     # No penalty when context is absent - BOS is self-sufficient as a structural signal
 
     score = 0.0
-    if bos_body_ratio >= 0.5:
+    if bos_body_ratio >= 0.50:
         score += 0.6
-    if bos_vol_ratio >= 1.2:
+    elif bos_body_ratio >= 0.40:
+        score += 0.35
+    if bos_vol_ratio >= 1.28:
         score += 0.5
-    if abs(c_low - swing_high) <= (0.15 * c_atr):
+    elif bos_vol_ratio >= 1.20:
+        score += 0.3
+    if abs(c_low - swing_high) <= (0.18 * c_atr):
         score += 0.5
+    elif abs(c_low - swing_high) <= (0.30 * c_atr):
+        score += 0.3
     if 50.0 <= c_rsi <= 60.0:
         score += 0.4
+    elif 48.0 <= c_rsi <= 62.0:
+        score += 0.2
     score = round(score, 2)
-    if score < 1.8:
+    if score < 1.78:
         _bump_reject(rejects, "reject_bos_score")
         return None
 
@@ -286,6 +314,7 @@ def _evaluate_nr4_1d(
         float(signal["ema_trend"]),
         float(signal["rsi"]),
         float(current["close"]),
+        float(current["ema_fast"]),
         float(current["atr"]),
         float(current["avg_vol"]),
         float(current["atr_avg"]),
@@ -310,6 +339,7 @@ def _evaluate_nr4_1d(
     s_rsi = float(signal["rsi"])
 
     c_close = float(current["close"])
+    c_ema_fast = float(current["ema_fast"])
     c_atr = float(current["atr"])
     c_atr_avg = float(current["atr_avg"])
     c_avg_vol = float(current["avg_vol"])
@@ -324,12 +354,13 @@ def _evaluate_nr4_1d(
     comp_range_b = comp_b_high - comp_b_low
     if comp_range_a <= 0 or comp_range_b <= 0:
         return None
-    if not (comp_range_a < atr10 and comp_range_b < atr10):
+    if not (comp_range_a < 0.90 * atr10 and comp_range_b < 0.90 * atr10):
         _bump_reject(rejects, "reject_nr4_compression")
         return None
 
     compression_high = max(comp_a_high, comp_b_high)
-    if s_close <= compression_high:
+    breakout_level = compression_high + (0.015 * c_atr)
+    if s_close <= breakout_level:
         _bump_reject(rejects, "reject_nr4_breakout")
         return None
     if not (s_ema_fast > s_ema_mid > s_ema_trend):
@@ -340,19 +371,26 @@ def _evaluate_nr4_1d(
     if signal_range <= 0:
         return None
     signal_body_ratio = abs(s_close - s_open) / signal_range
-    if not (s_close > s_open and signal_body_ratio >= 0.40):
+    if not (s_close > s_open and signal_body_ratio >= 0.48):
         _bump_reject(rejects, "reject_nr4_signal_body")
         return None
 
     signal_vol_ratio = s_vol / s_avg_vol
-    if signal_vol_ratio < 1.1:
+    if signal_vol_ratio < 1.20:
         _bump_reject(rejects, "reject_nr4_signal_volume")
         return None
 
-    if c_close <= s_high:
+    confirm_level = s_high + (0.03 * c_atr)
+    if c_close <= confirm_level:
         _bump_reject(rejects, "reject_nr4_confirmation")
         return None
-    if not (50.0 <= s_rsi <= 65.0):
+    if c_close > s_high + (0.30 * c_atr):
+        _bump_reject(rejects, "reject_nr4_confirmation")
+        return None
+    if c_close > c_ema_fast + (1.10 * c_atr):
+        _bump_reject(rejects, "reject_nr4_confirmation")
+        return None
+    if not (53.0 <= s_rsi <= 61.0):
         _bump_reject(rejects, "reject_nr4_signal_rsi")
         return None
 
@@ -378,16 +416,24 @@ def _evaluate_nr4_1d(
 
     compression_avg = (comp_range_a + comp_range_b) / 2.0
     score = 0.0
-    if compression_avg < (0.7 * atr10):
+    if compression_avg < (0.60 * atr10):
         score += 0.8
-    if signal_body_ratio >= 0.40:
-        score += 0.6
-    if signal_vol_ratio >= 1.1:
-        score += 0.3
-    if 55.0 <= s_rsi <= 62.0:
+    elif compression_avg < (0.75 * atr10):
         score += 0.5
+    if signal_body_ratio >= 0.56:
+        score += 0.6
+    elif signal_body_ratio >= 0.48:
+        score += 0.4
+    if signal_vol_ratio >= 1.35:
+        score += 0.35
+    elif signal_vol_ratio >= 1.20:
+        score += 0.2
+    if 54.0 <= s_rsi <= 59.5:
+        score += 0.5
+    elif 53.0 <= s_rsi <= 61.0:
+        score += 0.25
     score = round(score, 2)
-    if score < 2.0:
+    if score < 2.05:
         _bump_reject(rejects, "reject_nr4_score")
         return None
 
@@ -397,7 +443,7 @@ def _evaluate_nr4_1d(
     if risk_per_unit < (cfg.min_risk_atr * c_atr) or risk_per_unit > (cfg.max_risk_atr * c_atr):
         _bump_reject(rejects, "reject_nr4_risk")
         return None
-    rr = 3.0
+    rr = 2.5
     tp_price = entry_price + (risk_per_unit * rr)
 
     breakout_time = _format_breakout_time(signal.get("close_time"))
@@ -544,24 +590,24 @@ def evaluate_signal(
         # Aggressive relaxation phase to recover signal flow.
         if interval == "15m":
             # 15m is the primary frequency engine.
-            rsi_min, rsi_max = 46.0, 60.0
-            body_min         = 0.40
-            pullback_tol     = 2.10
+            rsi_min, rsi_max = 46.0, 60.5
+            body_min         = 0.42
+            pullback_tol     = 2.05
             rr               = 1.5
             stop_buf         = 0.40
-            min_score_iv     = 1.2
-            spread_max_iv    = 2.80
-            volume_min_iv    = 0.90
-        elif interval == "1h":
-            # 1h should add moderate flow, not stay starved.
-            rsi_min, rsi_max = 47.0, 59.0
-            body_min         = 0.40
-            pullback_tol     = 1.60
-            rr               = 2.00
-            stop_buf         = 0.35
-            min_score_iv     = 1.6
-            spread_max_iv    = 2.20
+            min_score_iv     = 1.20
+            spread_max_iv    = 2.60
             volume_min_iv    = 0.95
+        elif interval == "1h":
+            # 1h rework: simple, robust EMA pullback profile.
+            rsi_min, rsi_max = 49.0, 57.0
+            body_min         = 0.42
+            pullback_tol     = 1.35
+            rr               = 2.00
+            stop_buf         = 0.30
+            min_score_iv     = 1.40
+            spread_max_iv    = 1.75
+            volume_min_iv    = 0.98
         elif interval == "4h":
             rsi_min, rsi_max = 48.0, 65.0
             body_min         = 0.60
@@ -589,8 +635,7 @@ def evaluate_signal(
         )
     elif _strict and interval == "1h":
         trend_ok = (
-            s_ema_fast > s_ema_mid
-            and s_ema_mid >= (s_ema_trend - (0.95 * s_atr))
+            s_ema_fast > s_ema_mid > s_ema_trend
         )
     elif _strict and interval in {"4h", "1d"}:
         trend_ok = s_ema_fast > s_ema_mid and s_ema_mid > s_ema_trend
@@ -607,8 +652,10 @@ def evaluate_signal(
         return None
     # Dead zone becomes a soft penalty on intraday engines, not a hard block.
     if _strict and 0.35 <= spread_atr < 0.50:
-        if interval in {"15m", "1h"}:
-            score_penalty += 0.25
+        if interval == "15m":
+            score_penalty += 0.08
+        elif interval == "1h":
+            pass
         else:
             _r("reject_spread_dead_zone")
             return None
@@ -646,44 +693,35 @@ def evaluate_signal(
     if volume_ratio < volume_min_iv:
         _r("reject_volume")
         return None
-    if _strict and interval in {"15m", "1h"}:
+    if _strict and interval == "15m":
         # Convert moderate volume chase into score penalty; keep only severe spikes as hard reject.
         rsi_mid = rsi_min + 0.5 * (rsi_max - rsi_min)
-        if interval == "15m":
-            if volume_ratio > 3.8 and s_rsi >= (rsi_mid + 1.0):
-                _r("reject_volume_extreme")
-                return None
-            if volume_ratio > 2.8 and s_rsi >= rsi_mid:
-                score_penalty += 0.20
-        else:
-            if volume_ratio > 3.5 and s_rsi >= (rsi_mid + 1.0):
-                _r("reject_volume_extreme")
-                return None
-            if volume_ratio > 2.6 and s_rsi >= rsi_mid:
-                score_penalty += 0.20
+        if volume_ratio > 3.6 and s_rsi >= (rsi_mid + 1.0):
+            _r("reject_volume_extreme")
+            return None
+        if volume_ratio > 2.6 and s_rsi >= rsi_mid:
+            score_penalty += 0.08
 
     # Anti-extension / anti-momentum filters (production only).
     if _strict:
         if interval == "15m":
             # Keep only severe extension as hard reject; penalize moderate extension.
-            if (s_high - s_ema_fast) > 2.30 * s_atr:
+            if (s_high - s_ema_fast) > 2.20 * s_atr:
                 _r("reject_extension")
                 return None
-            if s_rsi > 63.0:
-                _r("reject_extension")
-                return None
-            if (s_high - s_ema_fast) > 1.75 * s_atr or s_rsi > 59.0:
-                score_penalty += 0.30
-        elif interval == "1h":
-            # Keep only severe extension as hard reject; penalize moderate extension.
             if s_rsi > 62.0:
                 _r("reject_extension")
                 return None
-            if (s_ema_fast - s_ema_mid) > 2.20 * s_atr:
+            if (s_high - s_ema_fast) > 1.65 * s_atr or s_rsi > 58.5:
+                score_penalty += 0.14
+        elif interval == "1h":
+            # 1h simple: basic extension caps.
+            if s_rsi > 57.5:
                 _r("reject_extension")
                 return None
-            if s_rsi > 59.0 or (s_ema_fast - s_ema_mid) > 1.95 * s_atr:
-                score_penalty += 0.25
+            if s_close > s_ema_fast + (1.35 * s_atr):
+                _r("reject_extension")
+                return None
         elif interval == "4h":
             # Reject overextended RSI.
             if s_rsi > 68.0:
@@ -704,8 +742,11 @@ def evaluate_signal(
         rsi_in_top_decile = s_rsi >= (rsi_max - 0.10 * rsi_band)
         far_from_ema20 = s_close > s_ema_fast and (s_close - s_ema_fast) > 1.2 * s_atr
         if rsi_in_top_decile and far_from_ema20:
-            if interval in {"15m", "1h"}:
-                score_penalty += 0.30
+            if interval == "15m":
+                score_penalty += 0.10
+            elif interval == "1h":
+                _r("reject_extension")
+                return None
             else:
                 _r("reject_extension")
                 return None
@@ -719,30 +760,23 @@ def evaluate_signal(
         conf_body_ratio = conf_body / conf_range if conf_range > 0 else 0.0
         # Softer confirmation for higher flow on 15m.
         if not (
-            c_close >= s_close * 0.992                   # close enough to signal close
+            c_close >= s_close * 0.991                   # close enough to signal close
             and conf_bullish                             # bullish candle
-            and conf_body_ratio >= 0.12                  # smaller body accepted
-            and c_close <= s_high + 0.55 * s_atr         # allow some continuation
-            and c_low <= s_ema_fast + 0.75 * s_atr       # keep it near EMA20 zone
+            and conf_body_ratio >= 0.10                  # smaller body accepted
+            and c_close <= s_high + 0.60 * s_atr         # allow some continuation
+            and c_low <= s_ema_fast + 0.85 * s_atr       # keep it near EMA20 zone
         ):
             _r("reject_confirmation")
             return None
     elif _strict and interval == "1h":
         conf_body_ratio = conf_body / conf_range if conf_range > 0 else 0.0
-        recent_slice = df.iloc[-12:-2] if len(df) >= 12 else df.iloc[:-2]
-        avg_body_10 = float((recent_slice["close"] - recent_slice["open"]).abs().mean()) \
-            if not recent_slice.empty else 0.0
         if not (
-            c_close >= s_close * 0.997                   # close enough to signal close
+            c_close >= s_close * 0.998                   # close near/above signal close
             and conf_bullish                             # bullish candle
-            and conf_body_ratio >= 0.16                  # smaller body accepted
-            and c_close <= s_high + 0.50 * s_atr         # allow some continuation
-            and c_low <= s_ema_fast + 0.60 * s_atr       # keep it near EMA20 zone
+            and conf_body_ratio >= 0.16                  # avoid weak follow-through candles
+            and c_close <= s_high + 0.50 * s_atr         # avoid late chase entries
+            and c_low <= s_ema_fast + 0.60 * s_atr       # keep it around EMA20 pullback
         ):
-            _r("reject_confirmation")
-            return None
-        # Reject explosive confirmation candle.
-        if avg_body_10 > 0 and conf_body > 2.80 * avg_body_10:
             _r("reject_confirmation")
             return None
     elif _strict and interval == "4h":
@@ -783,17 +817,33 @@ def evaluate_signal(
             ctx_ema_trend = ema(context_df["close"], cfg.ema_trend).iloc[-1]
         ctx_price     = float(context_df["close"].iloc[-1])
         if pd.isna(ctx_ema_mid) or pd.isna(ctx_ema_trend):
-            htf_penalty = cfg.context_missing_penalty
+            htf_penalty = 0.0 if interval == "1h" else cfg.context_missing_penalty
         elif float(ctx_ema_mid) > float(ctx_ema_trend) and ctx_price > float(ctx_ema_mid):
             htf_bias = "LONG"
         else:
-            _r("reject_htf")
-            return None
+            if interval == "15m":
+                # 15m is execution engine: allow strong counter-trend setups with penalty.
+                strong_15m = (
+                    body_ratio >= 0.55
+                    and volume_ratio >= 1.30
+                    and 48.0 <= s_rsi <= 56.0
+                )
+                if strong_15m:
+                    htf_bias = "NEUTRAL"
+                    htf_penalty += 0.20
+                else:
+                    _r("reject_htf")
+                    return None
+            else:
+                _r("reject_htf")
+                return None
     else:
         # 1d is at the top of the hierarchy - no higher HTF exists by design.
         # Applying penalty here can block all 1d signals mathematically
         # (score max 2.43 < min_score_iv 2.6 when penalty is 0.5).
-        if interval != "1d":
+        if interval == "1h":
+            htf_penalty = 0.0
+        elif interval != "1d":
             htf_penalty = cfg.context_missing_penalty
 
     stop_price    = s_low - (stop_buf * s_atr)
@@ -815,12 +865,15 @@ def evaluate_signal(
             2,
         )
     elif _strict and interval == "1h":
+        # 1h rework: simple score using body, spread, RSI zone and confirmation quality.
+        confirm_quality = min(1.0, conf_body_ratio / 0.32)
+        rsi_quality = 0.45 if 50.0 <= s_rsi <= 55.5 else 0.2
         score = round(
-            1.0 * body_ratio
-            + (0.7 if s_rsi > rsi_min + 2 else 0.0)
-            + 0.7 * spread_norm
-            - htf_penalty
-            - score_penalty,
+            1.00 * body_ratio
+            + 0.80 * spread_norm
+            + 0.60 * confirm_quality
+            + rsi_quality
+            - htf_penalty,
             2,
         )
     elif _strict and interval == "4h":

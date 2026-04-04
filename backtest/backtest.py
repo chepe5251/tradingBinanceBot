@@ -29,7 +29,7 @@ Configuration constants (edit at top of file):
   MAX_CANDLES_HOLD     : max candles before force-closing a trade as TIMEOUT
   SKIP_AFTER_SIGNAL    : candles to skip after a signal to avoid overlapping trades
   MAX_DL_WORKERS       : parallel threads for Phase 1 download
-  SIM_WORKERS          : parallel processes for Phase 2 simulation (auto = cpu_count)
+  SIM_WORKERS          : parallel processes for Phase 2 simulation (default 10)
 
 Usage (from repo root):
     python backtest/backtest.py
@@ -83,16 +83,16 @@ def _env_float(name: str, default: float) -> float:
     return parsed if parsed > 0 else default
 
 
-TOP_SYMBOLS = _env_int("BACKTEST_TOP_SYMBOLS", 80)
+TOP_SYMBOLS = _env_int("BACKTEST_TOP_SYMBOLS", 300)
 # Import the same hierarchy used by the live bot - ensures backtest
 # and production always simulate the exact same intervals and contexts.
 INTERVALS: list[str] = list(ENTRY_INTERVALS)  # ["15m", "1h", "4h", "1d"]
 
 CANDLES_PER_INTERVAL: dict[str, int] = {
-    "15m": _env_int("BACKTEST_CANDLES_15M", 2200),  # fast default profile
-    "1h":  _env_int("BACKTEST_CANDLES_1H", 1400),
-    "4h":  _env_int("BACKTEST_CANDLES_4H", 850),
-    "1d":  _env_int("BACKTEST_CANDLES_1D", 600),
+    "15m": _env_int("BACKTEST_CANDLES_15M", 5000),
+    "1h":  _env_int("BACKTEST_CANDLES_1H", 3000),
+    "4h":  _env_int("BACKTEST_CANDLES_4H", 1500),
+    "1d":  _env_int("BACKTEST_CANDLES_1D", 900),
 }
 
 INITIAL_CAPITAL = 500.0
@@ -127,7 +127,7 @@ _STRATEGY_CFG = StrategyConfig(
 MAX_CANDLES_HOLD = 50   # close at market after this many candles
 SKIP_AFTER_SIGNAL = 10  # skip candles after a signal to avoid overlap
 MAX_DL_WORKERS = _env_int("BACKTEST_DL_WORKERS", 10)  # I/O download threads
-SIM_WORKERS    = _env_int("BACKTEST_SIM_WORKERS", max(1, multiprocessing.cpu_count() - 1))
+SIM_WORKERS    = _env_int("BACKTEST_SIM_WORKERS", multiprocessing.cpu_count())  # CPU simulation workers
 RATE_LIMIT_PER_MIN = _env_int("BACKTEST_RATE_LIMIT_PER_MIN", 1200)
 USE_KLINE_CACHE = os.getenv("BACKTEST_USE_CACHE", "1").strip().lower() not in {"0", "false", "no"}
 KLINE_CACHE_MAX_AGE_MIN = _env_int("BACKTEST_CACHE_MAX_AGE_MIN", 180)
