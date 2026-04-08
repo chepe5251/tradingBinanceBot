@@ -1,0 +1,14 @@
+{
+  "side": "BUY",
+  "price": 110.15,
+  "stop_price": 109.1,
+  "tp_price": 112.25,
+  "risk_per_unit": 1.05,
+  "rr_target": 2.0,
+  "atr": 1.0,
+  "score": 1.84,
+  "htf_bias": "NEUTRAL",
+  "strategy": "ema_pullback_long",
+  "confirm_m15": "ema_pullback body=0.38 vol=1.20x rsi=55.0 spread=0.30atr atr_vs_avg=1.00x",
+  "breakout_time": "2025-01-02 16:00:00 UTC"
+}

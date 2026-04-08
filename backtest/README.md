@@ -1,173 +1,53 @@
-# Backtest and Stage 2 Analysis
+# Backtest Guide
 
-`backtest/backtest.py` simulates trades and writes:
-- `backtest/results/backtest_*.csv` (trade rows)
-- `backtest/results/analysis_*.csv` (segment aggregates)
-- `backtest/results/equity_*.csv` (equity/drawdown)
+`backtest/backtest.py` runs an offline simulation using the same signal engine as runtime.
 
-## Scope Guard (Critical)
+## What It Produces
 
-All Stage 2 tools are offline analysis only.
+Each run writes three files in `backtest/results/`:
+- `backtest_YYYYMMDD_HHMMSS.csv`: one row per simulated trade
+- `analysis_YYYYMMDD_HHMMSS.csv`: grouped metrics by interval/score/RSI/volume/hour/day
+- `equity_YYYYMMDD_HHMMSS.csv`: cumulative PnL and drawdown per trade
 
-They do **not** modify:
-- leverage
-- live sizing behavior
-- margin per trade in production
-- max exposure / max positions
-- live defaults
-- entry/exit runtime logic
-
-Any candidate improvement must be validated offline and only then considered
-for a future gated runtime flag.
-
-## 1) Run Standard Backtest
+## Run
 
 ```bash
 python backtest/backtest.py
 ```
 
-## 2) Regime Analysis
+## Runtime Model
 
-`analysis/regime.py` labels each trade using deterministic snapshot features:
-- `trend_regime`
-- `volatility_regime`
-- `structure_regime`
-- `combined_regime` (`trend|volatility`)
+- Phase 1 (I/O): parallel download of klines with rate limiter and optional cache.
+- Phase 2 (CPU): parallel simulation by symbol using process workers.
+- Strategy path is shared via `strategy.evaluate_signal`.
+- For `15m`, the engine does a second pass with `interval="15m_short"` only when long returns `None`.
+- Exits are fixed TP/SL plus timeout in simulation (no trailing behavior in backtest).
 
-Use from Python:
+## KeyboardInterrupt Safety
 
-```python
-import csv
-from analysis.regime import add_regime_labels, regime_analysis, print_regime_report
+If you interrupt the run (`Ctrl+C`) during download or simulation:
+- the script keeps completed work,
+- marks the run as partial,
+- and still saves available CSV outputs.
 
-with open("backtest/results/backtest_YYYYMMDD_HHMMSS.csv", encoding="utf-8") as f:
-    trades = list(csv.DictReader(f))
-for t in trades:
-    t["pnl_usdt"] = float(t["pnl_usdt"])
-    t["ema_spread"] = float(t.get("ema_spread", 0) or 0)
-    t["vol_ratio"] = float(t.get("vol_ratio", 0) or 0)
-    t["body_ratio"] = float(t.get("body_ratio", 0) or 0)
+## Main Environment Controls
 
-add_regime_labels(trades)
-report = regime_analysis(trades)
-print_regime_report(report)
-```
+Common knobs (from `.env`):
+- `BACKTEST_TOP_SYMBOLS`
+- `BACKTEST_CANDLES_15M`, `BACKTEST_CANDLES_1H`, `BACKTEST_CANDLES_4H`, `BACKTEST_CANDLES_1D`
+- `BACKTEST_DL_WORKERS`
+- `BACKTEST_SIM_WORKERS`
+- `BACKTEST_RATE_LIMIT_PER_MIN`
+- `BACKTEST_USE_CACHE`
+- `BACKTEST_CACHE_MAX_AGE_MIN`
 
-## 3) Walk-Forward Robustness
-
-```bash
-python backtest/walk_forward.py \
-  --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
-  --mode rolling --window 30 --step 15
-```
-
-Also supports:
-- `--mode expanding`
-- `--output` (CSV path)
-- `--markdown` (optional markdown summary)
-
-Per-window metrics include:
-- trades
-- pnl
-- winrate
-- expectancy
-- profit factor
-- max drawdown %
-- top-winner concentration (Top5 %)
-
-Global summary includes:
-- % windows with PF > 1
-- % windows with positive expectancy
-- % windows with positive PnL
-- variance/stdev indicators
-- high-drawdown window count
-- consistency verdict
-
-## 4) OOS Validation
-
-Single cut by date:
+## Quick Validation
 
 ```bash
-python backtest/oos_split.py \
-  --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
-  --split 2026-03-01
+python -m py_compile backtest/backtest.py
+python -m pytest tests/test_golden_regression.py -q
 ```
 
-By percentage:
-
-```bash
-python backtest/oos_split.py \
-  --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
-  --pct 0.7
-```
-
-Multi-cut:
-
-```bash
-python backtest/oos_split.py \
-  --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
-  --splits 2026-02-01 2026-03-01 2026-04-01
-```
-
-Optional exports:
-- `--output` CSV
-- `--markdown` markdown summary
-
-Verdicts:
-- `estabilidad_aceptable`
-- `degradacion_leve`
-- `degradacion_moderada`
-- `degradacion_severa`
-
-## 5) Candidate Filter Framework (Offline)
-
-`analysis/filter_experiments.py` supports baseline vs variants:
-- min/max score
-- include/exclude symbols
-- include/exclude intervals
-- include/exclude hours
-- include/exclude weekdays
-- market phase / regime filters
-- AND/OR combinations
-
-Example:
-
-```python
-import csv
-from analysis.filter_experiments import (
-    compare_variants,
-    combine_filters,
-    filter_min_score,
-    filter_exclude_weekdays,
-    save_experiment_csv,
-    save_experiment_markdown,
-)
-
-with open("backtest/results/backtest_YYYYMMDD_HHMMSS.csv", encoding="utf-8") as f:
-    trades = list(csv.DictReader(f))
-for t in trades:
-    t["pnl_usdt"] = float(t["pnl_usdt"])
-    t["score"] = float(t.get("score", 0) or 0)
-
-variants = {
-    "baseline": None,
-    "score>=2.0": filter_min_score(2.0),
-    "score>=2.0_no_weekend": combine_filters([
-        filter_min_score(2.0),
-        filter_exclude_weekdays({"Sat", "Sun"}),
-    ]),
-}
-results = compare_variants(trades, variants)
-save_experiment_csv(results, "backtest/results/filter_experiments.csv")
-save_experiment_markdown(results, "backtest/results/filter_experiments.md")
-```
-
-## 6) Comparative Summary
-
-`analysis/reporting.py` provides pure markdown summary builders to combine:
-- baseline metrics
-- walk-forward summary
-- OOS comparison rows
-- filter-variant rows
-
-Use it to generate fast decision docs without touching runtime code.
+Golden fixtures used by regression tests:
+- `tests/fixtures/golden_strategy_signal_1h.json`
+- `tests/fixtures/golden_backtest_sim_1h.json`

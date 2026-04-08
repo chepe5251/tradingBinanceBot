@@ -4,7 +4,24 @@ Trading bot for Binance USDT-M futures with:
 - REST scheduler over closed candles
 - EMA-pullback strategy shared by live and backtest
 - paper and live modes
-- position monitoring (TP/SL, breakeven, trailing)
+- position monitoring (TP/SL + breakeven)
+
+## Versioning and Releases
+
+- Latest release tag: `v1.0.3`.
+- Project versioning uses repository tags with SemVer format: `vMAJOR.MINOR.PATCH`.
+- Detailed release notes are maintained in [CHANGELOG.md](CHANGELOG.md).
+
+Recommended release gate before tagging:
+
+```bash
+ruff check .
+python -m py_compile main.py config.py strategy.py execution.py monitor.py monitor_runtime.py monitor_orphan.py backtest/backtest.py
+python -m pytest tests/ -v -m unit
+python -m pytest tests/ -v -m integration
+python -m pytest tests/ --cov=risk --cov=strategy --cov=sizing --cov=execution --cov=monitor_logic --cov=indicators --cov-report=term-missing -q
+docker build -t binance_bot_ci .
+```
 
 ## Runtime (Live/Paper)
 
@@ -23,6 +40,12 @@ Run:
 ```bash
 python main.py
 ```
+
+### Monitoring Behavior
+
+- Protections are managed with fixed TP/SL orders plus breakeven updates.
+- Trailing logic is intentionally disabled in runtime monitor/orphan flows.
+- This keeps live and backtest exit behavior aligned with current validated baselines.
 
 ## Stage 3 Operations (Runtime Hardening)
 
@@ -107,7 +130,7 @@ Paper runs now expose clearer operational traces:
 - protection status
 - exit result and realized pnl
 - paper equity snapshots in ops status artifacts
-- shared `trace_id` to follow signal → entry → monitor → exit
+- shared `trace_id` to follow signal -> entry -> monitor -> exit
 
 ### Operational Alerts (Optional)
 
@@ -119,17 +142,9 @@ When enabled, Telegram can receive rate-limited alerts for:
 - orphan detected/resumed/unrecoverable
 - hourly/daily operational summaries
 
-## Stage 2 Analysis (Offline Only)
+## Backtest (Offline)
 
-Stage 2 tooling is focused on diagnosis/validation/experimentation.
-
-Important:
-- It does **not** change leverage.
-- It does **not** change effective sizing/exposure.
-- It does **not** change live default behaviour.
-- It does **not** auto-enable any filter in production.
-
-### 1. Standard Backtest
+Run:
 
 ```bash
 python backtest/backtest.py
@@ -137,70 +152,13 @@ python backtest/backtest.py
 
 Outputs in `backtest/results/`:
 - `backtest_*.csv` (trade-level rows)
-- `analysis_*.csv` (segment aggregates)
-- `equity_*.csv` (equity/drawdown curve)
+- `analysis_*.csv` (aggregates by interval/score/RSI/volume/etc.)
+- `equity_*.csv` (equity and drawdown curve)
 
-### 2. Market Regime Analysis
-
-`analysis/regime.py` adds deterministic labels from trade snapshots:
-- trend: `trending_up*`, `trending_down*`, `ranging`, `transitioning`
-- volatility: `high_volatility`, `normal_volatility`, `low_volatility`
-- structure: `compression`, `balanced`, `expansion`
-
-### 3. Walk-Forward Stability
-
-```bash
-python backtest/walk_forward.py --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv
-```
-
-Supports:
-- `--mode rolling|expanding`
-- per-window metrics (PnL, trades, WR, expectancy, PF, max DD, top-winner concentration)
-- global consistency summary
-- CSV output (`walk_forward_*.csv`) and optional markdown (`--markdown`)
-
-### 4. OOS Validation
-
-```bash
-python backtest/oos_split.py --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv --split 2026-03-01
-```
-
-Also supports:
-- `--pct` (percentage split)
-- `--splits` (multi-cut by dates)
-
-Outputs:
-- console comparison
-- optional CSV/markdown summaries
-
-Verdict labels:
-- `estabilidad_aceptable`
-- `degradacion_leve`
-- `degradacion_moderada`
-- `degradacion_severa`
-
-### 5. Candidate Filter Experiments (Offline)
-
-`analysis/filter_experiments.py` provides baseline-vs-variant comparison.
-
-Examples of candidate filters:
-- minimum score
-- excluded hours/weekdays
-- excluded symbols
-- excluded intervals
-- excluded market/regime buckets
-- simple combinations (`AND` / `OR`)
-
-Outputs available:
-- console report
-- CSV summary
-- markdown summary
-
-### 6. Comparative Reporting Helpers
-
-`analysis/reporting.py` includes pure functions for:
-- markdown table rendering
-- compact Stage 2 summary assembly (baseline + walk-forward + OOS + filters)
+Behavior notes:
+- Backtest uses the same `evaluate_signal` strategy logic as runtime.
+- 15m short is evaluated as second pass (`interval="15m_short"`) only when 15m long returns `None`.
+- If interrupted (`Ctrl+C`), partial progress is preserved and partial CSV outputs are still generated.
 
 ## Tests
 
@@ -216,6 +174,16 @@ Unit-only:
 python -m pytest tests/ -v -m unit
 ```
 
+Golden regression tests (recommended before strategy/backtest refactors):
+
+```bash
+python -m pytest tests/test_golden_regression.py -q
+```
+
+Golden fixtures:
+- `tests/fixtures/golden_strategy_signal_1h.json`
+- `tests/fixtures/golden_backtest_sim_1h.json`
+
 ## Backtest Docs
 
-See `backtest/README.md` for detailed Stage 2 workflows and interpretation guidance.
+See `backtest/README.md` for backtest runtime details and reliability notes.

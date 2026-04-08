@@ -585,91 +585,6 @@ class FuturesExecutor:
                 on_event("critical", float(current_sl))
         return (tp_ok and sl_ok), time.time(), tp_ref, sl_ref
 
-    def _handle_breakeven(
-        self,
-        side: str,
-        price: float,
-        current_entry: float,
-        current_sl: float,
-        current_tp: Optional[float],
-        current_be_trigger: float,
-        break_even: bool,
-        current_qty: float,
-        tp_ref: "OrderRef",
-        sl_ref: "OrderRef",
-        last_replace_ts: float,
-        client_id_prefix: Optional[str],
-        on_event: Optional[callable],
-    ) -> tuple[float, bool, float, "OrderRef", "OrderRef"]:
-        """Move SL to entry when price clears the breakeven trigger level.
-
-        Returns: (new_sl, break_even_activated, new_last_replace_ts, tp_ref, sl_ref)
-        """
-        if break_even or current_be_trigger <= 0:
-            return current_sl, False, last_replace_ts, tp_ref, sl_ref
-        if side == "BUY" and price >= current_entry * (1 + current_be_trigger):
-            new_sl = current_entry
-        elif side == "SELL" and price <= current_entry * (1 - current_be_trigger):
-            new_sl = current_entry
-        else:
-            return current_sl, False, last_replace_ts, tp_ref, sl_ref
-        if time.time() - last_replace_ts < 2:
-            return current_sl, False, last_replace_ts, tp_ref, sl_ref
-        tp_ref, sl_ref = self.replace_tp_sl(
-            side,
-            current_tp if current_tp is not None else current_entry,
-            new_sl,
-            current_qty,
-            client_id_prefix=client_id_prefix,
-        )
-        if on_event:
-            on_event("breakeven", new_sl)
-        return new_sl, True, time.time(), tp_ref, sl_ref
-
-    def _handle_trailing(
-        self,
-        side: str,
-        price: float,
-        current_sl: float,
-        current_tp: Optional[float],
-        current_qty: float,
-        atr_use: float,
-        trail_mult: float,
-        tp_ref: "OrderRef",
-        sl_ref: "OrderRef",
-        last_replace_ts: float,
-        client_id_prefix: Optional[str],
-        on_event: Optional[callable],
-    ) -> tuple[float, Optional[float], float, "OrderRef", "OrderRef"]:
-        """Ratchet SL and TP upward (BUY) or downward (SELL) using ATR trailing.
-
-        Returns: (new_sl, new_tp, new_last_replace_ts, tp_ref, sl_ref)
-        """
-        if side == "BUY":
-            new_sl = price - (atr_use * trail_mult)
-            new_tp = max(float(current_tp or 0.0), price + (atr_use * trail_mult))
-            improve_sl = new_sl > current_sl
-            improve_tp = current_tp is None or new_tp > current_tp
-        else:
-            new_sl = price + (atr_use * trail_mult)
-            new_tp = min(float(current_tp or price), price - (atr_use * trail_mult))
-            improve_sl = new_sl < current_sl
-            improve_tp = current_tp is None or new_tp < current_tp
-        if (improve_sl or improve_tp) and time.time() - last_replace_ts < 2:
-            improve_sl = False
-            improve_tp = False
-        if not (improve_sl or improve_tp):
-            return current_sl, current_tp, last_replace_ts, tp_ref, sl_ref
-        target_sl = new_sl if improve_sl else current_sl
-        target_tp = new_tp if improve_tp else current_tp
-        tp_ref, sl_ref = self.replace_tp_sl(
-            side, target_tp, target_sl, current_qty,
-            client_id_prefix=client_id_prefix,
-        )
-        if on_event:
-            on_event("trail", target_sl)
-        return target_sl, target_tp, time.time(), tp_ref, sl_ref
-
     def monitor_oco(
         self,
         tp_ref: OrderRef,
@@ -681,8 +596,6 @@ class FuturesExecutor:
         qty: Optional[float] = None,
         atr: Optional[float] = None,
         breakeven_trigger_pct: float = 0.0,
-        trail_mult: float = 0.0,
-        trail_activation_pct: float = 0.0,
         price_fn: Optional[callable] = None,
         atr_fn: Optional[callable] = None,
         on_event: Optional[callable] = None,
@@ -706,8 +619,6 @@ class FuturesExecutor:
         current_entry = entry_price
         current_qty = qty
         current_be_trigger = max(float(breakeven_trigger_pct or 0.0), 0.005)  # x20 floor: 0.5%
-        effective_trail_activation = max(float(trail_activation_pct or 0.0), 0.01)
-        effective_trail_mult = min(float(trail_mult), 0.8) if trail_mult > 0 else 0.0  # x20 cap
         current_tp = tp_price
         current_sl = sl_price
         last_replace = 0.0
@@ -804,7 +715,7 @@ class FuturesExecutor:
                             continue
                         return f"EARLY:{reason}" if reason else "EARLY", float(price_fn() or current_entry)
 
-            # ── Breakeven and trailing management ────────────────────────────
+            # ── Breakeven management ────────────────────────────
             if side and current_entry and current_qty and price_fn:
                 try:
                     price = float(price_fn())
@@ -814,30 +725,24 @@ class FuturesExecutor:
                     if current_sl is None:
                         current_sl = current_entry
                     if not break_even and current_be_trigger > 0:
-                        current_sl, activated, last_replace, tp_ref, sl_ref = self._handle_breakeven(
-                            side, price, current_entry, current_sl, current_tp, current_be_trigger,
-                            break_even, current_qty, tp_ref, sl_ref, last_replace, client_id_prefix, on_event,
-                        )
-                        if activated:
-                            break_even = True
-                    pnl_pct = 0.0
-                    if side == "BUY" and current_entry > 0:
-                        pnl_pct = (price - current_entry) / current_entry
-                    elif side == "SELL" and current_entry > 0:
-                        pnl_pct = (current_entry - price) / current_entry
-                    if break_even and effective_trail_mult > 0 and pnl_pct >= effective_trail_activation:
-                        atr_use = atr
-                        if atr_fn:
-                            try:
-                                atr_use = float(atr_fn())
-                            except Exception:  # atr_fn is caller-provided; fall back to snapshot ATR
-                                atr_use = atr
-                        if atr_use and atr_use > 0:
-                            current_sl, current_tp, last_replace, tp_ref, sl_ref = self._handle_trailing(
-                                side, price, current_sl, current_tp, current_qty,
-                                atr_use, effective_trail_mult, tp_ref, sl_ref, last_replace,
-                                client_id_prefix, on_event,
+                        be_price = None
+                        if side == "BUY" and price >= current_entry * (1 + current_be_trigger):
+                            be_price = current_entry
+                        elif side == "SELL" and price <= current_entry * (1 - current_be_trigger):
+                            be_price = current_entry
+                        if be_price is not None and time.time() - last_replace >= 2:
+                            tp_ref, sl_ref = self.replace_tp_sl(
+                                side,
+                                current_tp if current_tp is not None else current_entry,
+                                be_price,
+                                current_qty,
+                                client_id_prefix=client_id_prefix,
                             )
+                            current_sl = be_price
+                            break_even = True
+                            last_replace = time.time()
+                            if on_event:
+                                on_event("breakeven", be_price)
 
             time.sleep(0.5)
 
@@ -852,3 +757,4 @@ class FuturesExecutor:
             if oid is not None and int(oid) == int(algo_id):
                 return True
         return False
+

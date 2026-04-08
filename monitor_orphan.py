@@ -218,8 +218,6 @@ def resume_orphan_position(
             qty=float(orphan_trade_state["qty"]),
             atr=atr_orphan,
             breakeven_trigger_pct=float(orphan_trade_state["breakeven_trigger_pct"]),
-            trail_mult=0.8,
-            trail_activation_pct=max(settings.trailing_activation_pct, 0.01),
             price_fn=_price_fn,
             atr_fn=_atr_fn,
             on_event=_on_event,

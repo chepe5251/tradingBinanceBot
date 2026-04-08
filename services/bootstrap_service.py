@@ -32,6 +32,7 @@ DEFAULT_HTF_MAP: dict[str, str] = {
     "3m": "15m",
     "5m": "15m",
     "15m": "1h",
+    "15m_short": "1h",
     "30m": "2h",
     "1h": "4h",
     "2h": "8h",
@@ -218,19 +219,33 @@ def _build_stream(
     settings: Settings,
     evaluation_intervals: list[str],
 ) -> MarketDataStream:
-    main_limit = max(120, settings.history_candles_main)
-    context_limit = max(120, settings.history_candles_context)
+    cfg = strategy_config_from_settings(settings)
+    warmup_min = max(
+        cfg.ema_trend + 3,
+        cfg.volume_avg_window + 3,
+        cfg.atr_avg_window + 3,
+        cfg.rsi_period + 3,
+    )
+    warmup_with_buffer = max(120, warmup_min + 40)
+    history_by_interval: dict[str, int] = {
+        "15m": max(warmup_with_buffer, 320),
+        "1h": max(warmup_with_buffer, 280),
+        "4h": max(warmup_with_buffer, 260),
+        "1d": max(warmup_with_buffer, 240),
+    }
+
+    main_interval = evaluation_intervals[0]  # "15m"
+    main_limit = max(120, history_by_interval.get(main_interval, settings.history_candles_main))
 
     extra_intervals: dict[str, int] = {}
-    for interval in evaluation_intervals:
-        if interval == settings.main_interval:
-            continue
-        extra_intervals[interval] = context_limit
+    for interval in evaluation_intervals[1:]:
+        limit = history_by_interval.get(interval, settings.history_candles_context)
+        extra_intervals[interval] = max(120, limit)
 
     return MarketDataStream(
         client=client,
         symbols=symbols,
-        main_interval=settings.main_interval,
+        main_interval=main_interval,
         main_limit=main_limit,
         testnet=settings.data_use_testnet,
         extra_intervals=extra_intervals,
@@ -356,3 +371,4 @@ def bootstrap_runtime(settings: Settings, api_key: str, api_secret: str) -> Runt
         operations=operations,
         metadata_service=metadata_service,
     )
+

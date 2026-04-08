@@ -189,8 +189,8 @@ def _evaluate_bos_4h(
             _bump_reject(rejects, "reject_bos_missing")
         return None
 
-    retest_min = swing_high - (0.35 * c_atr)
-    retest_max = swing_high + (0.50 * c_atr)
+    retest_min = swing_high - (0.45 * c_atr)
+    retest_max = swing_high + (0.55 * c_atr)
     if not (retest_min <= c_low <= retest_max):
         _bump_reject(rejects, "reject_bos_retest_zone")
         return None
@@ -207,6 +207,12 @@ def _evaluate_bos_4h(
     atr_avg_ratio = c_atr / c_atr_avg if c_atr_avg > 0 else 1.0
     if atr_avg_ratio > cfg.max_atr_avg_ratio:
         _bump_reject(rejects, "reject_bos_atr_spike")
+        return None
+
+    # Block spread >= 1.0 when RSI is not confirmed
+    bos_spread_atr = (c_ema_fast - c_ema_mid) / c_atr if c_atr > 0 else 0.0
+    if bos_spread_atr >= 1.00 and c_rsi < 57.0:
+        _bump_reject(rejects, "reject_bos_spread_cold")
         return None
 
     htf_bias = "LONG"  # BOS is structural - assume bullish unless context contradicts
@@ -251,7 +257,7 @@ def _evaluate_bos_4h(
     elif 48.0 <= c_rsi <= 62.0:
         score += 0.2
     score = round(score, 2)
-    if score < 1.78:
+    if score < 1.70:
         _bump_reject(rejects, "reject_bos_score")
         return None
 
@@ -384,13 +390,13 @@ def _evaluate_nr4_1d(
     if c_close <= confirm_level:
         _bump_reject(rejects, "reject_nr4_confirmation")
         return None
-    if c_close > s_high + (0.30 * c_atr):
+    if c_close > s_high + (0.40 * c_atr):
         _bump_reject(rejects, "reject_nr4_confirmation")
         return None
     if c_close > c_ema_fast + (1.10 * c_atr):
         _bump_reject(rejects, "reject_nr4_confirmation")
         return None
-    if not (53.0 <= s_rsi <= 61.0):
+    if not (52.0 <= s_rsi <= 62.0):
         _bump_reject(rejects, "reject_nr4_signal_rsi")
         return None
 
@@ -433,7 +439,7 @@ def _evaluate_nr4_1d(
     elif 53.0 <= s_rsi <= 61.0:
         score += 0.25
     score = round(score, 2)
-    if score < 2.05:
+    if score < 1.90:
         _bump_reject(rejects, "reject_nr4_score")
         return None
 
@@ -461,6 +467,186 @@ def _evaluate_nr4_1d(
         "confirm_m15": (
             f"nr4_breakout sig_body={signal_body_ratio:.2f} sig_vol={signal_vol_ratio:.2f}x "
             f"sig_rsi={s_rsi:.1f} atr_vs_avg={atr_avg_ratio:.2f}x"
+        ),
+        "breakout_time": breakout_time,
+    }
+
+
+def _evaluate_short_15m(
+    df: pd.DataFrame,
+    context_df: pd.DataFrame,
+    cfg: StrategyConfig,
+    rejects: dict | None,
+) -> Optional[dict]:
+    """Mean-reversion short for 15m: fade overextended bullish moves."""
+    if len(df) < 3:
+        return None
+
+    def _r(key: str) -> None:
+        _bump_reject(rejects, key)
+
+    sig  = df.iloc[-2]   # signal candle
+    conf = df.iloc[-1]   # confirmation candle
+
+    required = [
+        "open","high","low","close","volume",
+        "ema_fast","ema_mid","ema_trend","atr","atr_avg","avg_vol","rsi",
+    ]
+    if any(pd.isna(sig.get(c)) for c in required):
+        return None
+    if any(pd.isna(conf.get(c)) for c in required[:6]):
+        return None
+
+    s_open     = float(sig["open"])
+    s_high     = float(sig["high"])
+    s_low      = float(sig["low"])
+    s_close    = float(sig["close"])
+    s_vol      = float(sig["volume"])
+    s_ema_fast = float(sig["ema_fast"])
+    s_ema_mid  = float(sig["ema_mid"])
+    s_ema_trend= float(sig["ema_trend"])
+    s_atr      = float(sig["atr"])
+    s_avg_atr  = float(sig["atr_avg"])
+    s_avg_vol  = float(sig["avg_vol"])
+    s_rsi      = float(sig["rsi"])
+
+    c_close    = float(conf["close"])
+    c_open     = float(conf["open"])
+    c_high     = float(conf["high"])
+    c_low      = float(conf["low"])
+
+    if s_atr <= 0 or s_avg_vol <= 0:
+        return None
+
+    candle_range = s_high - s_low
+    if candle_range <= 0:
+        return None
+
+    # 1) Tendencia: NO requiere downtrend estructural.
+    #    Solo requiere que EMA20 > EMA50 (mercado no en colapso total)
+    #    para confirmar que hay algo que revertir.
+    if s_ema_fast <= s_ema_mid:
+        _r("reject_short_no_extension_base")
+        return None
+
+    # 2) Extensión: precio muy por encima de EMA20.
+    extension_atr = (s_high - s_ema_fast) / s_atr
+    if extension_atr < 1.80:
+        _r("reject_short_extension")
+        return None
+
+    # Block when EMA20-EMA50 spread is too wide — strong trend,
+    # mean reversion has no edge.
+    short_spread_atr = (s_ema_fast - s_ema_mid) / s_atr
+    if short_spread_atr >= 1.20:
+        _r("reject_short_spread_wide")
+        return None
+
+    # 3) RSI sobrecomprado.
+    if not (70.0 <= s_rsi <= 74.0):
+        _r("reject_short_rsi")
+        return None
+
+    # 4) Vela de señal bajista con cuerpo fuerte en tercio inferior.
+    body = abs(s_close - s_open)
+    body_ratio = body / candle_range
+    lower_third = s_high - (2 / 3) * candle_range
+    if not (s_close < s_open and body_ratio >= 0.65 and s_close < lower_third):
+        _r("reject_short_body")
+        return None
+
+    # 5) Volumen presente.
+    volume_ratio = s_vol / s_avg_vol
+    if volume_ratio < 1.10:
+        _r("reject_short_volume")
+        return None
+
+    # 6) ATR no en spike extremo.
+    atr_avg_ratio = s_atr / s_avg_atr if s_avg_atr > 0 else 1.0
+    if atr_avg_ratio > cfg.max_atr_avg_ratio:
+        _r("reject_short_atr_spike")
+        return None
+
+    # 7) Confirmación: vela bajista que cierra bajo el low de la señal.
+    conf_range = c_high - c_low
+    conf_body  = abs(c_close - c_open)
+    conf_body_ratio = conf_body / conf_range if conf_range > 0 else 0.0
+    if not (
+        c_close < c_open          # bajista
+        and c_close < s_low       # cierra bajo el low de señal
+        and conf_body_ratio >= 0.35  # cuerpo decente
+    ):
+        _r("reject_short_confirmation")
+        return None
+
+    # 8) Contexto HTF: solo operar short si HTF no es fuertemente alcista,
+    #    o si la extensión es tan extrema que justifica contra-tendencia.
+    htf_penalty = 0.0
+    min_ctx_len = max(cfg.ema_mid, cfg.ema_trend)
+    if not context_df.empty and len(context_df) >= min_ctx_len:
+        if "ema_mid" in context_df.columns and "ema_trend" in context_df.columns:
+            ctx_ema_mid   = context_df["ema_mid"].iloc[-1]
+            ctx_ema_trend = context_df["ema_trend"].iloc[-1]
+        else:
+            ctx_ema_mid   = ema(context_df["close"], cfg.ema_mid).iloc[-1]
+            ctx_ema_trend = ema(context_df["close"], cfg.ema_trend).iloc[-1]
+        ctx_price = float(context_df["close"].iloc[-1])
+        if not (pd.isna(ctx_ema_mid) or pd.isna(ctx_ema_trend)):
+            if float(ctx_ema_mid) > float(ctx_ema_trend) and ctx_price > float(ctx_ema_mid):
+                # HTF alcista: solo permitir si extensión es extrema (>= 2.5 ATR)
+                if extension_atr >= 2.50:
+                    htf_penalty = 0.25  # penalidad por ir contra tendencia
+                else:
+                    _r("reject_short_htf")
+                    return None
+    else:
+        htf_penalty = 0.15  # sin contexto: penalidad leve
+
+    # 9) Score.
+    ext_score = min(1.0, (extension_atr - 1.80) / 0.80)   # 0..1 entre 1.8 y 2.6 ATR
+    rsi_score = min(1.0, (s_rsi - 70.0) / 10.0)           # 0..1 entre RSI 70 y 80
+    score = round(
+        0.8 * body_ratio
+        + 0.7 * ext_score
+        + 0.6 * rsi_score
+        + (0.3 if volume_ratio >= 1.30 else 0.0)
+        - htf_penalty,
+        2,
+    )
+    if score < 1.30:
+        _r("reject_short_score")
+        return None
+
+    # 10) SL/TP.
+    entry_price   = c_close
+    stop_price    = s_high + (0.30 * s_atr)   # sobre el high de señal
+    risk_per_unit = stop_price - entry_price
+    if risk_per_unit < (cfg.min_risk_atr * s_atr) or risk_per_unit > (cfg.max_risk_atr * s_atr):
+        _r("reject_short_risk")
+        return None
+    rr = 1.5
+    tp_price = entry_price - (risk_per_unit * rr)
+
+    ts = conf.get("close_time")
+    breakout_time = (
+        ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+        if isinstance(ts, pd.Timestamp) else str(ts)
+    )
+
+    return {
+        "side": "SELL",
+        "price": entry_price,
+        "stop_price": stop_price,
+        "tp_price": tp_price,
+        "risk_per_unit": risk_per_unit,
+        "rr_target": rr,
+        "atr": float(s_atr),
+        "score": score,
+        "htf_bias": "SHORT_MR",
+        "strategy": "mean_reversion_short_15m",
+        "confirm_m15": (
+            f"mr_short body={body_ratio:.2f} vol={volume_ratio:.2f}x "
+            f"rsi={s_rsi:.1f} ext={extension_atr:.2f}atr atr_vs_avg={atr_avg_ratio:.2f}x"
         ),
         "breakout_time": breakout_time,
     }
@@ -524,6 +710,8 @@ def evaluate_signal(
         return _evaluate_bos_4h(df=df, context_df=context_df, cfg=cfg, rejects=rejects)
     if _strict and interval == "1d":
         return _evaluate_nr4_1d(df=df, context_df=context_df, cfg=cfg, rejects=rejects)
+    if _strict and interval == "15m_short":
+        return _evaluate_short_15m(df=df, context_df=context_df, cfg=cfg, rejects=rejects)
 
     sig  = df.iloc[-2]   # signal candle
     conf = df.iloc[-1]   # confirmation candle
@@ -599,16 +787,16 @@ def evaluate_signal(
             volume_min_iv    = 0.95
         elif interval == "1h":
             # 1h rework: simple, robust EMA pullback profile.
-            rsi_min, rsi_max = 49.0, 57.0
+            rsi_min, rsi_max = 50.0, 56.5
             body_min         = 0.42
             pullback_tol     = 1.35
             rr               = 2.00
             stop_buf         = 0.30
-            min_score_iv     = 1.40
+            min_score_iv     = 1.55
             spread_max_iv    = 1.75
             volume_min_iv    = 0.98
         elif interval == "4h":
-            rsi_min, rsi_max = 48.0, 65.0
+            rsi_min, rsi_max = 54.0, 65.0
             body_min         = 0.60
             pullback_tol     = 0.80
             rr               = 2.5
@@ -652,7 +840,8 @@ def evaluate_signal(
     # Dead zone becomes a soft penalty on intraday engines, not a hard block.
     if _strict and 0.35 <= spread_atr < 0.50:
         if interval == "15m":
-            score_penalty += 0.08
+            _r("reject_spread_dead_zone")
+            return None
         elif interval == "1h":
             pass
         else:
@@ -721,10 +910,18 @@ def evaluate_signal(
             if s_close > s_ema_fast + (1.35 * s_atr):
                 _r("reject_extension")
                 return None
+            # Block overextended spread with cold RSI - high score but low quality
+            if spread_atr >= 0.80 and s_rsi < 53.0:
+                _r("reject_spread_cold_1h")
+                return None
         elif interval == "4h":
             # Reject overextended RSI.
             if s_rsi > 68.0:
                 _r("reject_extension")
+                return None
+            # Block overextended spread when momentum is not confirmed.
+            if spread_atr >= 1.00 and s_rsi < 57.0:
+                _r("reject_spread_cold")
                 return None
         elif interval == "1d":
             # Reject overextended RSI.
@@ -742,7 +939,7 @@ def evaluate_signal(
         far_from_ema20 = s_close > s_ema_fast and (s_close - s_ema_fast) > 1.2 * s_atr
         if rsi_in_top_decile and far_from_ema20:
             if interval == "15m":
-                score_penalty += 0.10
+                score_penalty += 0.12
             elif interval == "1h":
                 _r("reject_extension")
                 return None
@@ -772,7 +969,7 @@ def evaluate_signal(
         if not (
             c_close >= s_close * 0.998                   # close near/above signal close
             and conf_bullish                             # bullish candle
-            and conf_body_ratio >= 0.16                  # avoid weak follow-through candles
+            and conf_body_ratio >= 0.20                  # avoid weak follow-through candles
             and c_close <= s_high + 0.50 * s_atr         # avoid late chase entries
             and c_low <= s_ema_fast + 0.60 * s_atr       # keep it around EMA20 pullback
         ):

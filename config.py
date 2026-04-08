@@ -73,10 +73,8 @@ class Settings:
     # ATR-based management
     atr_sl_mult: float = 1.6
     atr_tp_mult: float = 1.8
-    atr_trail_mult: float = 1.0
     min_sl_pct: float = 0.007
     breakeven_trigger_pct: float = 0.006
-    trailing_activation_pct: float = 0.010
     stop_atr_mult: float = 1.2
     tp_rr: float = 1.8
 
@@ -139,7 +137,7 @@ def load_env(path: str = ".env") -> None:
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            # Strip trailing inline comments (e.g. "0.05  # note" → "0.05")
+            # Strip inline comments suffix (e.g. "0.05  # note" → "0.05")
             if " #" in value:
                 value = value.split(" #")[0].rstrip()
             if key and key not in os.environ:
@@ -341,10 +339,8 @@ def from_env() -> Settings:
 
     _set_float(settings, "atr_sl_mult", "ATR_SL_MULT", minimum=0.0)
     _set_float(settings, "atr_tp_mult", "ATR_TP_MULT", minimum=0.0)
-    _set_float(settings, "atr_trail_mult", "ATR_TRAIL_MULT", minimum=0.0)
     _set_float(settings, "min_sl_pct", "MIN_SL_PCT", minimum=0.0)
     _set_float(settings, "breakeven_trigger_pct", "BREAKEVEN_TRIGGER_PCT", minimum=0.0)
-    _set_float(settings, "trailing_activation_pct", "TRAILING_ACTIVATION_PCT", minimum=0.0)
     _set_float(settings, "stop_atr_mult", "STOP_ATR_MULT", minimum=0.0)
     _set_float(settings, "tp_rr", "TP_RR", minimum=0.1)
 

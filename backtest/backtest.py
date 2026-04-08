@@ -54,11 +54,26 @@ from binance import Client
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import from_env  # noqa: E402
 from indicators import atr_series, ema, rsi  # noqa: E402
-from services.bootstrap_service import ENTRY_CONTEXT_MAP, ENTRY_INTERVALS  # noqa: E402
+from services.bootstrap_service import DEFAULT_HTF_MAP, build_interval_plan  # noqa: E402
 from strategy import StrategyConfig, evaluate_signal  # noqa: E402
 
 # -- configuration --
 APP_SETTINGS = from_env()
+
+
+def _build_backtest_interval_plan(settings) -> tuple[list[str], dict[str, str]]:
+    """Reuse runtime interval plan and extend one extra HTF level for backtest coverage."""
+    intervals, context_map = build_interval_plan(settings)
+    if intervals:
+        highest = intervals[-1]
+        next_higher = DEFAULT_HTF_MAP.get(highest)
+        if next_higher and next_higher not in intervals:
+            intervals.append(next_higher)
+            context_map[highest] = next_higher
+    return intervals, context_map
+
+
+ENTRY_INTERVALS, ENTRY_CONTEXT_MAP = _build_backtest_interval_plan(APP_SETTINGS)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -89,10 +104,10 @@ TOP_SYMBOLS = _env_int("BACKTEST_TOP_SYMBOLS", 300)
 INTERVALS: list[str] = list(ENTRY_INTERVALS)  # ["15m", "1h", "4h", "1d"]
 
 CANDLES_PER_INTERVAL: dict[str, int] = {
-    "15m": _env_int("BACKTEST_CANDLES_15M", 5000),
-    "1h":  _env_int("BACKTEST_CANDLES_1H", 3000),
-    "4h":  _env_int("BACKTEST_CANDLES_4H", 1500),
-    "1d":  _env_int("BACKTEST_CANDLES_1D", 900),
+    "15m": _env_int("BACKTEST_CANDLES_15M", 10000),
+    "1h":  _env_int("BACKTEST_CANDLES_1H", 8000),
+    "4h":  _env_int("BACKTEST_CANDLES_4H", 3000),
+    "1d":  _env_int("BACKTEST_CANDLES_1D", 1000),
 }
 
 INITIAL_CAPITAL = 500.0
@@ -203,9 +218,16 @@ def _sleep_if_banned(exc: Exception, *, max_wait_sec: float = 300.0) -> bool:
 def _klines_cache_path(symbol: str, interval: str, limit: int) -> str:
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
     os.makedirs(cache_dir, exist_ok=True)
-    safe_symbol = re.sub(r"[^A-Z0-9_]", "_", symbol.upper())
+    safe_symbol   = re.sub(r"[^A-Z0-9_]", "_", symbol.upper())
     safe_interval = re.sub(r"[^A-Z0-9_]", "_", interval.upper())
-    return os.path.join(cache_dir, f"{safe_symbol}_{safe_interval}_{limit}.pkl")
+    cfg_sig = (
+        f"e{APP_SETTINGS.ema_fast}"
+        f"m{APP_SETTINGS.ema_mid}"
+        f"t{APP_SETTINGS.ema_trend}"
+        f"a{APP_SETTINGS.atr_period}"
+        f"r{APP_SETTINGS.rsi_period}"
+    )
+    return os.path.join(cache_dir, f"{safe_symbol}_{safe_interval}_{limit}_{cfg_sig}.pkl")
 
 
 def _load_klines_cache(
@@ -410,6 +432,17 @@ def _fetch_klines(client: Client, symbol: str, interval: str, limit: int) -> pd.
     df = df.drop_duplicates(subset=["open_time"]).sort_values("open_time").reset_index(drop=True)
     df["open_time"]  = pd.to_datetime(df["open_time"],  unit="ms", utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+
+    # Precalcular indicadores con la config activa antes de cachear.
+    # strategy.py reutiliza columnas existentes y no las recalcula en Phase 2.
+    df["ema_fast"]  = ema(df["close"], APP_SETTINGS.ema_fast)
+    df["ema_mid"]   = ema(df["close"], APP_SETTINGS.ema_mid)
+    df["ema_trend"] = ema(df["close"], APP_SETTINGS.ema_trend)
+    df["atr"]       = atr_series(df, ATR_PERIOD)
+    df["atr_avg"]   = df["atr"].rolling(max(1, APP_SETTINGS.atr_avg_window)).mean()
+    df["avg_vol"]   = df["volume"].rolling(max(1, APP_SETTINGS.volume_avg_window)).mean()
+    df["rsi"]       = rsi(df["close"], APP_SETTINGS.rsi_period)
+
     _save_klines_cache(symbol, interval, limit, df)
     return df
 
@@ -447,22 +480,27 @@ def _simulate_trades(
 
     Returns (trades, skipped_4h_sell, skipped_low_score, rejects, diagnostics).
     """
-    # Precompute indicators once for extra CSV fields and signal evaluation reuse.
-    ema20   = _ema_col(df["close"], APP_SETTINGS.ema_fast)
-    ema50   = _ema_col(df["close"], APP_SETTINGS.ema_mid)
-    ema200  = _ema_col(df["close"], APP_SETTINGS.ema_trend)
-    atr     = _atr_col(df, ATR_PERIOD)
-    atr_avg = atr.rolling(APP_SETTINGS.atr_avg_window).mean()
-    avg_vol = df["volume"].rolling(APP_SETTINGS.volume_avg_window).mean()
-    rsi     = _rsi_col(df["close"], APP_SETTINGS.rsi_period)
+    # Reusar indicadores precalculados si ya vienen en el DataFrame (cache hit).
+    # Solo recalcular columnas que falten.
     df = df.copy()
-    df["ema_fast"] = ema20
-    df["ema_mid"] = ema50
-    df["ema_trend"] = ema200
-    df["atr"] = atr
-    df["atr_avg"] = atr_avg
-    df["avg_vol"] = avg_vol
-    df["rsi"] = rsi
+    ema20   = df["ema_fast"]  if "ema_fast"  in df.columns else _ema_col(df["close"], APP_SETTINGS.ema_fast)
+    ema50   = df["ema_mid"]   if "ema_mid"   in df.columns else _ema_col(df["close"], APP_SETTINGS.ema_mid)
+    ema200  = df["ema_trend"] if "ema_trend" in df.columns else _ema_col(df["close"], APP_SETTINGS.ema_trend)
+    atr     = df["atr"]       if "atr"       in df.columns else _atr_col(df, ATR_PERIOD)
+    atr_avg = df["atr_avg"]   if "atr_avg"   in df.columns else atr.rolling(max(1, APP_SETTINGS.atr_avg_window)).mean()
+    avg_vol = df["avg_vol"]   if "avg_vol"   in df.columns else df["volume"].rolling(APP_SETTINGS.volume_avg_window).mean()
+    rsi     = df["rsi"]       if "rsi"       in df.columns else _rsi_col(df["close"], APP_SETTINGS.rsi_period)
+    for col, series in [
+        ("ema_fast",  ema20),
+        ("ema_mid",   ema50),
+        ("ema_trend", ema200),
+        ("atr",       atr),
+        ("atr_avg",   atr_avg),
+        ("avg_vol",   avg_vol),
+        ("rsi",       rsi),
+    ]:
+        if col not in df.columns:
+            df[col] = series
 
     trades: list[dict] = []
     rejects: dict[str, int] = {}
@@ -521,6 +559,19 @@ def _simulate_trades(
             diagnostics["eval_exceptions"] += 1
             i += 1
             continue
+
+        # Second pass: try mean-reversion short on 15m when long fails.
+        if signal is None and interval == "15m":
+            try:
+                signal = evaluate_signal(
+                    sub,
+                    context_sub,
+                    _STRATEGY_CFG,
+                    interval="15m_short",
+                    rejects=rejects,
+                )
+            except Exception:
+                diagnostics["eval_exceptions"] += 1
 
         if signal is None:
             i += 1
@@ -1239,6 +1290,42 @@ def _simulate_task(args: tuple) -> tuple[str, str, list[dict], int, int, dict[st
     return sym, interval, trades, s4h, ssc, rejects, diagnostics
 
 
+def _simulate_task_by_symbol(args: tuple) -> tuple[str, list[dict], int, int, dict[str, int], dict[str, dict[str, int]], dict[str, int]]:
+    """Procesa todos los intervalos de un símbolo en un solo worker."""
+    sym, intervals_data = args
+    # intervals_data = {interval: (df_dict, context_dict)}
+
+    all_trades: list[dict] = []
+    total_s4h = 0
+    total_ssc = 0
+    all_rejects: dict[str, int] = {}
+    rejects_by_interval: dict[str, dict[str, int]] = {}
+    all_diagnostics: dict[str, int] = {"eval_calls": 0, "signals": 0, "eval_exceptions": 0}
+
+    for interval, (df_dict, context_dict) in intervals_data.items():
+        df = pd.DataFrame(df_dict)
+        df["open_time"] = pd.to_datetime(df["open_time"], utc=True)
+        df["close_time"] = pd.to_datetime(df["close_time"], utc=True)
+
+        context_df = pd.DataFrame()
+        if context_dict:
+            context_df = pd.DataFrame(context_dict)
+            context_df["open_time"] = pd.to_datetime(context_df["open_time"], utc=True)
+            context_df["close_time"] = pd.to_datetime(context_df["close_time"], utc=True)
+
+        trades, s4h, ssc, rejects, diagnostics = _simulate_trades(df, sym, interval, context_df=context_df)
+        all_trades.extend(trades)
+        total_s4h += s4h
+        total_ssc += ssc
+        rejects_by_interval[interval] = dict(rejects)
+        for k, v in rejects.items():
+            all_rejects[k] = all_rejects.get(k, 0) + v
+        for k, v in diagnostics.items():
+            all_diagnostics[k] = all_diagnostics.get(k, 0) + int(v)
+
+    return sym, all_trades, total_s4h, total_ssc, all_rejects, rejects_by_interval, all_diagnostics
+
+
 # -- main --
 
 def main() -> None:
@@ -1266,8 +1353,11 @@ def main() -> None:
     dl_done = 0
     dl_errors = 0
     t0 = time.time()
+    interrupted_phase1 = False
 
-    with ThreadPoolExecutor(max_workers=MAX_DL_WORKERS) as executor:
+    executor = ThreadPoolExecutor(max_workers=MAX_DL_WORKERS)
+    futures = {}
+    try:
         futures = {executor.submit(_download_one, t): t for t in download_tasks}
         for future in as_completed(futures):
             dl_done += 1
@@ -1283,6 +1373,11 @@ def main() -> None:
                 print(f"  Downloaded: {dl_done}/{total_dl} | "
                       f"{elapsed:.0f}s elapsed | ~{remaining:.0f}s remaining | "
                       f"{dl_errors} errors")
+    except KeyboardInterrupt:
+        interrupted_phase1 = True
+        print("\n[WARN] Interrupted during download phase. Continuing with downloaded datasets...")
+    finally:
+        executor.shutdown(wait=not interrupted_phase1, cancel_futures=interrupted_phase1)
 
     _dl_end = time.time()
     print(f"Phase 1 complete: {len(kline_data)} datasets OK, {dl_errors} errors "
@@ -1297,21 +1392,22 @@ def main() -> None:
     eval_calls_total = 0
     eval_signals_total = 0
     eval_exceptions_total = 0
-    total_sim = len(kline_data)
     sim_done  = 0
+    interrupted_phase2 = False
 
     print(f"\n{'=' * 60}")
     print("  PHASE 2: TRADE SIMULATION")
     print(f"{'=' * 60}")
     print(f"  Using {SIM_WORKERS} parallel processes")
 
-    # Serialize DataFrames to dicts for efficient pickling
+    # Agrupar por símbolo: 1 tarea por símbolo en lugar de 1 por (símbolo × intervalo).
+    # Reduce IPC de ~1200 tareas a ~300.
     context_by_interval: dict[str, str] = ENTRY_CONTEXT_MAP
 
-    sim_args = []
+    sym_args: dict[str, dict] = {}
     for (sym, interval), df in kline_data.items():
         df_send = df.copy()
-        df_send["open_time"] = df_send["open_time"].astype(str)
+        df_send["open_time"]  = df_send["open_time"].astype(str)
         df_send["close_time"] = df_send["close_time"].astype(str)
 
         context_dict: dict = {}
@@ -1319,41 +1415,55 @@ def main() -> None:
         if context_interval:
             context_df = kline_data.get((sym, context_interval))
             if context_df is not None and not context_df.empty:
-                context_send = context_df.copy()
-                context_send["open_time"] = context_send["open_time"].astype(str)
-                context_send["close_time"] = context_send["close_time"].astype(str)
-                context_dict = context_send.to_dict("list")
+                ctx_send = context_df.copy()
+                ctx_send["open_time"]  = ctx_send["open_time"].astype(str)
+                ctx_send["close_time"] = ctx_send["close_time"].astype(str)
+                context_dict = ctx_send.to_dict("list")
 
-        sim_args.append((df_send.to_dict("list"), context_dict, sym, interval))
+        sym_args.setdefault(sym, {})[interval] = (df_send.to_dict("list"), context_dict)
+
+    sim_args = list(sym_args.items())  # [(sym, {interval: (df_dict, ctx_dict)}), ...]
+    total_sim = len(sim_args)
     del kline_data  # free memory
 
     t1 = time.time()
-    with ProcessPoolExecutor(max_workers=SIM_WORKERS) as executor:
-        futures = {executor.submit(_simulate_task, args): (args[2], args[3])
-                   for args in sim_args}
+    executor = ProcessPoolExecutor(max_workers=SIM_WORKERS)
+    futures = {}
+    try:
+        futures = {
+            executor.submit(_simulate_task_by_symbol, args): args[0]
+            for args in sim_args
+        }
         for future in as_completed(futures):
             sim_done += 1
+            sym = futures[future]
             try:
-                sym, interval, trades, s4h, ssc, rejects, diagnostics = future.result()
+                sym, trades, s4h, ssc, rejects, rejects_by_iv, diagnostics = future.result()
                 all_trades.extend(trades)
                 total_skipped_4h_sell   += s4h
                 total_skipped_low_score += ssc
-                eval_calls_total += int(diagnostics.get("eval_calls", 0))
-                eval_signals_total += int(diagnostics.get("signals", 0))
+                eval_calls_total      += int(diagnostics.get("eval_calls", 0))
+                eval_signals_total    += int(diagnostics.get("signals", 0))
                 eval_exceptions_total += int(diagnostics.get("eval_exceptions", 0))
-                for key, value in rejects.items():
-                    reject_totals[key] = reject_totals.get(key, 0) + int(value)
-                    iv_rejects = reject_by_interval.setdefault(interval, {})
-                    iv_rejects[key] = iv_rejects.get(key, 0) + int(value)
+                for k, v in rejects.items():
+                    reject_totals[k] = reject_totals.get(k, 0) + int(v)
+                for iv, iv_rejects in rejects_by_iv.items():
+                    dest = reject_by_interval.setdefault(iv, {})
+                    for k, v in iv_rejects.items():
+                        dest[k] = dest.get(k, 0) + int(v)
             except Exception as exc:
-                sym, interval = futures[future]
-                print(f"  [SIM ERROR] {sym} {interval}: {exc}")
-            if sim_done % 200 == 0 or sim_done == total_sim:
+                print(f"  [SIM ERROR] {sym}: {exc}")
+            if sim_done % 50 == 0 or sim_done == total_sim:
                 elapsed   = time.time() - t1
                 rate      = sim_done / elapsed if elapsed > 0 else 1
                 remaining = (total_sim - sim_done) / rate if rate > 0 else 0
                 print(f"  Simulated: {sim_done}/{total_sim} | "
                       f"{elapsed:.0f}s | ~{remaining:.0f}s remaining")
+    except KeyboardInterrupt:
+        interrupted_phase2 = True
+        print("\n[WARN] Interrupted during simulation phase. Saving partial results...")
+    finally:
+        executor.shutdown(wait=not interrupted_phase2, cancel_futures=interrupted_phase2)
 
     del sim_args  # free memory
 
@@ -1368,6 +1478,8 @@ def main() -> None:
     print(f"  Signals emitted (pre-trade): {eval_signals_total}")
     print(f"  Exceptions in evaluate_signal: {eval_exceptions_total}")
     print(f"  Trades generated: {len(all_trades)}")
+    if interrupted_phase1 or interrupted_phase2:
+        print("  NOTE: partial run (interrupted by user)")
 
     reject_keys = [
         "reject_trend",

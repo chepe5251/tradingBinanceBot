@@ -15,4 +15,5 @@ logs/
 
 # Backtest outputs
 backtest/results/
+backtest/cache/
 .coverage

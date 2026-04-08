@@ -67,8 +67,6 @@ def run_position_monitor(monitor: Any) -> None:
         qty=float(trade_state["qty"]),
         atr=monitor.atr_val,
         breakeven_trigger_pct=float(trade_state["breakeven_trigger_pct"]),
-        trail_mult=0.8,
-        trail_activation_pct=max(monitor.settings.trailing_activation_pct, 0.01),
         price_fn=monitor.price_fn,
         atr_fn=monitor.atr_fn,
         on_event=monitor.on_event,
