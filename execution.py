@@ -384,27 +384,27 @@ class FuturesExecutor:
             tp_cid = f"{safe}-TP"
             sl_cid = f"{safe}-SL"
 
+        # STOP_MARKET / TAKE_PROFIT_MARKET con closePosition=true:
+        # se ejecutan a mercado al tocar stopPrice (no quedan colgadas en un
+        # gap como las variantes LIMIT) y cierran toda la posicion sin
+        # depender del qty exacto ni de reduceOnly.
         tp_order = self.client.futures_create_order(
             symbol=self.symbol,
             side="SELL" if is_long else "BUY",
-            type="TAKE_PROFIT",
-            timeInForce="GTC",
-            quantity=qty,
-            price=str(tp_price),
+            type="TAKE_PROFIT_MARKET",
             stopPrice=str(tp_price),
-            reduceOnly=True,
+            closePosition=True,
+            workingType="MARK_PRICE",
             newClientOrderId=tp_cid,
         )
 
         sl_order = self.client.futures_create_order(
             symbol=self.symbol,
             side="SELL" if is_long else "BUY",
-            type="STOP",
-            timeInForce="GTC",
-            quantity=qty,
-            price=str(sl_price),
+            type="STOP_MARKET",
             stopPrice=str(sl_price),
-            reduceOnly=True,
+            closePosition=True,
+            workingType="MARK_PRICE",
             newClientOrderId=sl_cid,
         )
 
@@ -530,10 +530,16 @@ class FuturesExecutor:
         Applies a 2-second guard after the last replace to avoid false fills
         from stale exchange state.
         """
+        self._last_tp_fill_price = 0.0
+        self._last_sl_fill_price = 0.0
         if tp_ref.kind == "order":
             tp = self.client.futures_get_order(symbol=self.symbol, orderId=tp_ref.order_id)
             tp_open = tp.get("status") not in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
             tp_filled = tp.get("status") == "FILLED"
+            if tp_filled:
+                self._last_tp_fill_price = self._first_positive_float(
+                    tp.get("avgPrice"), tp.get("price"), default=0.0
+                )
         else:
             tp_open = self._is_algo_open(tp_ref.order_id)
             tp_filled = not tp_open
@@ -542,6 +548,10 @@ class FuturesExecutor:
             sl = self.client.futures_get_order(symbol=self.symbol, orderId=sl_ref.order_id)
             sl_open = sl.get("status") not in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
             sl_filled = sl.get("status") == "FILLED"
+            if sl_filled:
+                self._last_sl_fill_price = self._first_positive_float(
+                    sl.get("avgPrice"), sl.get("price"), default=0.0
+                )
         else:
             sl_open = self._is_algo_open(sl_ref.order_id)
             sl_filled = not sl_open
@@ -682,10 +692,12 @@ class FuturesExecutor:
             tp_filled, sl_filled, tp_open, sl_open = self._check_order_fill_status(tp_ref, sl_ref, last_replace)
             if tp_filled and sl_open:
                 self.client.futures_cancel_all_open_orders(symbol=self.symbol)
-                return "TP", float(current_tp or 0.0)
+                tp_exit = getattr(self, "_last_tp_fill_price", 0.0) or float(current_tp or 0.0)
+                return "TP", float(tp_exit)
             if sl_filled and tp_open:
                 self.client.futures_cancel_all_open_orders(symbol=self.symbol)
-                return "SL", float(current_sl or 0.0)
+                sl_exit = getattr(self, "_last_sl_fill_price", 0.0) or float(current_sl or 0.0)
+                return "SL", float(sl_exit)
             if tp_filled and sl_filled:
                 return "UNKNOWN", float(current_sl or 0.0)
 

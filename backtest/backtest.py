@@ -2,7 +2,9 @@
 
 Downloads historical klines from Binance Futures, runs evaluate_signal candle-by-candle
 for M15 / 1H / 4H across the top 300 USDT-M perpetual pairs by volume, simulates trades
-using the exact same filters as the live bot, and saves three CSV files:
+using the exact same filters as the live bot. Entry/SL/TP are reconstructed to match
+entry_service.py (offset + sl_common + rr efectivo). Exit simulation is still simplified
+(see _simulate_trades). Saves three CSV files:
 
   - backtest_YYYYMMDD_HHMMSS.csv   : one row per simulated trade with full metadata
   - analysis_YYYYMMDD_HHMMSS.csv   : aggregated stats grouped by interval, score, RSI, etc.
@@ -141,6 +143,9 @@ _STRATEGY_CFG = StrategyConfig(
 )
 MAX_CANDLES_HOLD = 50   # close at market after this many candles
 SKIP_AFTER_SIGNAL = 10  # skip candles after a signal to avoid overlap
+
+# Modela el movimiento de SL a breakeven igual que monitor_oco en vivo.
+SIMULATE_BREAKEVEN = os.getenv("BACKTEST_SIMULATE_BE", "1").strip().lower() not in {"0", "false", "no"}
 MAX_DL_WORKERS = _env_int("BACKTEST_DL_WORKERS", 10)  # I/O download threads
 SIM_WORKERS    = _env_int("BACKTEST_SIM_WORKERS", multiprocessing.cpu_count())  # CPU simulation workers
 RATE_LIMIT_PER_MIN = _env_int("BACKTEST_RATE_LIMIT_PER_MIN", 1200)
@@ -584,16 +589,45 @@ def _simulate_trades(
             i += 1
             continue
 
-        if float(signal.get("score") or 0) < 1.0:
+        # evaluate_signal ya aplica min_score_iv por intervalo internamente.
+        # Mantener este contador solo como diagnostico defensivo.
+        if float(signal.get("score") or 0) <= 0.0:
             skipped_low_score += 1
             i += 1
             continue
 
-        entry_price = float(signal["price"])
-        stop_price  = float(signal["stop_price"])
-        tp_price    = float(signal["tp_price"])
+        raw_entry  = float(signal["price"])
         side  = signal["side"]
         score = float(signal.get("score") or 0.0)
+
+        # Replicar entry_service._entry_price_with_offset
+        limit_offset = APP_SETTINGS.limit_offset_pct
+        if side == "BUY":
+            entry_price = raw_entry * (1 - limit_offset)
+        else:
+            entry_price = raw_entry * (1 + limit_offset)
+
+        # Replicar el SL real: sl_common = min/max(swing, ATR-based)
+        # entry_service.py usa swing de las ultimas 10 velas (iloc[-10:-1])
+        swing_lo = float(low_arr[max(0, i - 9):i + 1].min())
+        swing_hi = float(high_arr[max(0, i - 9):i + 1].max())
+        atr_sig_now = _safe(atr, i)
+        if side == "BUY":
+            sl_atr_real = entry_price - APP_SETTINGS.stop_atr_mult * atr_sig_now
+            stop_price  = min(swing_lo, sl_atr_real)
+        else:
+            sl_atr_real = entry_price + APP_SETTINGS.stop_atr_mult * atr_sig_now
+            stop_price  = max(swing_hi, sl_atr_real)
+
+        # Replicar el TP real: rr efectivo = max(signal_rr, 1.8) sobre risk real
+        risk_real = abs(entry_price - stop_price)
+        signal_rr_eff = max(float(signal.get("rr_target") or 0.0), 1.8)
+        strategy_risk = float(signal.get("risk_per_unit") or 0.0)
+        tp_risk_basis = min(risk_real, strategy_risk) if strategy_risk > 0 else risk_real
+        if side == "BUY":
+            tp_price = entry_price + signal_rr_eff * tp_risk_basis
+        else:
+            tp_price = entry_price - signal_rr_eff * tp_risk_basis
 
         if entry_price <= 0 or stop_price <= 0 or tp_price <= 0:
             i += 1
@@ -668,15 +702,21 @@ def _simulate_trades(
         exit_j     = timeout_j
         candles_held = 0
 
+        # SL efectivo: arranca en stop_price y puede subir a breakeven.
+        effective_sl = stop_price
+        be_done = False
+        be_trigger = max(abs(entry_price - stop_price) * 0.3 / entry_price, 0.004) if entry_price > 0 else 0.004
+
         for j in range(i + 1, min(i + MAX_CANDLES_HOLD + 1, n)):
             candles_held = j - i
             c_high = float(high_arr[j])
             c_low  = float(low_arr[j])
 
             if side == "BUY":
-                if c_high >= tp_price and c_low <= stop_price:
-                    result = "LOSS"
-                    exit_price = stop_price
+                # Conservador: comprobar SL antes que TP en la misma vela.
+                if c_low <= effective_sl:
+                    result = "WIN" if (be_done and effective_sl >= entry_price) else "LOSS"
+                    exit_price = effective_sl
                     exit_j = j
                     break
                 if c_high >= tp_price:
@@ -684,15 +724,14 @@ def _simulate_trades(
                     exit_price = tp_price
                     exit_j = j
                     break
-                if c_low <= stop_price:
-                    result = "LOSS"
-                    exit_price = stop_price
-                    exit_j = j
-                    break
+                # Mover SL a breakeven si el precio avanzo lo suficiente.
+                if SIMULATE_BREAKEVEN and not be_done and c_high >= entry_price * (1 + be_trigger):
+                    effective_sl = max(effective_sl, entry_price)
+                    be_done = True
             else:  # SELL
-                if c_low <= tp_price and c_high >= stop_price:
-                    result = "LOSS"
-                    exit_price = stop_price
+                if c_high >= effective_sl:
+                    result = "WIN" if (be_done and effective_sl <= entry_price) else "LOSS"
+                    exit_price = effective_sl
                     exit_j = j
                     break
                 if c_low <= tp_price:
@@ -700,11 +739,9 @@ def _simulate_trades(
                     exit_price = tp_price
                     exit_j = j
                     break
-                if c_high >= stop_price:
-                    result = "LOSS"
-                    exit_price = stop_price
-                    exit_j = j
-                    break
+                if SIMULATE_BREAKEVEN and not be_done and c_low <= entry_price * (1 - be_trigger):
+                    effective_sl = min(effective_sl, entry_price)
+                    be_done = True
 
         exit_time = _fmt_ts(close_time_arr[exit_j])
 

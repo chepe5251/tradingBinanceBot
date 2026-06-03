@@ -177,16 +177,39 @@ class MarketDataStream:
             pool.submit(self._load_initial_one, symbol, interval, limit)
             for symbol, interval, limit in tasks
         ]
-        done, pending = wait(futures, timeout=max(60, len(tasks) // 2))
+        # Timeout proporcional al numero de tareas y al paralelismo real.
+        # Cada kline puede tardar ~2-4s con reintentos; estimar por lotes.
+        est_per_batch = 6.0
+        batches = (len(tasks) + self.max_workers - 1) // max(1, self.max_workers)
+        timeout_sec = max(120.0, batches * est_per_batch * 3)
+        done, pending = wait(futures, timeout=timeout_sec)
+        failed = 0
         for future in done:
             try:
                 future.result()
             except Exception as exc:  # noqa: BLE001
+                failed += 1
                 logger.debug("initial_worker_failed err=%s", exc)
         if pending:
-            logger.warning("initial_worker_timeout pending=%d", len(pending))
+            logger.warning(
+                "initial_worker_timeout pending=%d of %d (timeout=%.0fs) — "
+                "esos simbolos no tendran datos hasta el primer poll",
+                len(pending), len(tasks), timeout_sec,
+            )
             for future in pending:
                 future.cancel()
+        # Verificar cobertura: avisar si demasiados simbolos quedaron vacios.
+        empty = 0
+        with self._lock:
+            for interval, sym_map in self._candles.items():
+                for sym, series in sym_map.items():
+                    if len(series) == 0:
+                        empty += 1
+        if empty > 0:
+            logger.warning(
+                "load_initial: %d (symbol,interval) sin datos tras bootstrap",
+                empty,
+            )
 
     def _seconds_to_next_close(self) -> float:
         """Return seconds until the next main-interval candle close + 2 s buffer."""

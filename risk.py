@@ -125,6 +125,22 @@ class RiskManager:
             else:
                 self.state.consecutive_losses = 0
 
+    def reconcile_equity(self, real_equity: float, now: datetime) -> None:
+        """Sincroniza el equity con el balance real del exchange.
+
+        Llamar tras cada cierre de trade en modo live para corregir la
+        deriva entre el PnL estimado y el balance real (funding, fees,
+        redondeos, cierres fuera del monitor).
+        """
+        with self._lock:
+            if self.state.current_day != now.date():
+                self.state.current_day = now.date()
+                self.state.day_start_equity = real_equity
+                self.state.consecutive_losses = 0
+                self.state.paused = False
+            if real_equity > 0:
+                self.state.equity = real_equity
+
     def snapshot(self) -> RiskState:
         """Return a copy of the mutable state for read-only consumers."""
         with self._lock:

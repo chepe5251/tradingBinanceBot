@@ -111,7 +111,7 @@ class EntryService:
             trace_id=trace_id,
         )
 
-    def _on_close(self, interval: str) -> None:
+    def _on_close(self, interval: str, _followup_depth: int = 0) -> None:
         interval_state = self._interval_states[interval]
         close_ms = self._resolve_interval_close(interval, interval_state)
         if close_ms is None:
@@ -167,7 +167,9 @@ class EntryService:
 
         if not self._execute_candidate(best_candidate, interval):
             return
-        self._schedule_followup_if_needed(candidates, interval, interval_state)
+        self._schedule_followup_if_needed(
+            candidates, interval, interval_state, depth=_followup_depth
+        )
 
     def _resolve_interval_close(self, interval: str, interval_state: dict) -> int | None:
         anchor_symbol = self.symbols[0]
@@ -311,16 +313,21 @@ class EntryService:
         candidates: list[SignalCandidate],
         interval: str,
         interval_state: dict,
+        depth: int = 0,
     ) -> None:
         if len(candidates) <= 1:
+            return
+        # Tope de seguridad: como mucho (max_positions - 1) re-evaluaciones
+        # encadenadas por cierre de vela. Evita recursion ilimitada de hilos.
+        if depth >= max(0, self.settings.max_positions - 1):
             return
         self.position_cache.invalidate()
         with interval_state["lock"]:
             interval_state["last_close_ms"] = None
         threading.Thread(
-            target=lambda: self._on_close(interval),
+            target=lambda: self._on_close(interval, _followup_depth=depth + 1),
             daemon=True,
-            name=f"on_close_slot2_{interval}",
+            name=f"on_close_slot{depth + 2}_{interval}",
         ).start()
 
     def _broadcast_signal_alerts(self, candidates: list[SignalCandidate], interval: str) -> None:

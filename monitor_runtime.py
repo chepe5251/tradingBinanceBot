@@ -84,7 +84,17 @@ def run_position_monitor(monitor: Any) -> None:
         pnl = (exit_price - final_entry) * final_qty
         if monitor.side == "SELL":
             pnl = -pnl
-        monitor.risk_updater(pnl, datetime.now(timezone.utc))
+        now_utc = datetime.now(timezone.utc)
+        monitor.risk_updater(pnl, now_utc)
+        # En modo live, reconciliar el equity con el balance real del
+        # exchange para evitar deriva en el calculo de drawdown diario.
+        if not bool(monitor.executor.paper):
+            try:
+                from services.position_service import get_available_balance
+                real_bal = get_available_balance(monitor.executor.client)
+                monitor.risk.reconcile_equity(real_bal, now_utc)
+            except Exception as exc:  # noqa: BLE001
+                monitor.logger.debug("equity_reconcile_failed err=%s", exc)
         monitor.pos_cache_invalidate()
         equity_after = float(monitor.risk.snapshot().equity)
         monitor._ops_call(  # noqa: SLF001

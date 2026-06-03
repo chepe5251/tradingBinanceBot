@@ -38,6 +38,10 @@ class StrategyConfig:
     min_score: float = 1.5
     context_missing_penalty: float = 0.5
     max_atr_avg_ratio: float = 2.5
+    # Parametros del short de reversion 15m (antes hardcodeados).
+    short_min_extension_atr: float = 1.80
+    short_max_spread_atr: float = 1.20
+    short_min_body_ratio: float = 0.65
 
 
 def _bump_reject(rejects: dict | None, key: str) -> None:
@@ -531,19 +535,20 @@ def _evaluate_short_15m(
 
     # 2) Extensión: precio muy por encima de EMA20.
     extension_atr = (s_high - s_ema_fast) / s_atr
-    if extension_atr < 1.80:
+    if extension_atr < cfg.short_min_extension_atr:
         _r("reject_short_extension")
         return None
 
     # Block when EMA20-EMA50 spread is too wide — strong trend,
     # mean reversion has no edge.
     short_spread_atr = (s_ema_fast - s_ema_mid) / s_atr
-    if short_spread_atr >= 1.20:
+    if short_spread_atr >= cfg.short_max_spread_atr:
         _r("reject_short_spread_wide")
         return None
 
-    # 3) RSI sobrecomprado.
-    if not (70.0 <= s_rsi <= 74.0):
+    # 3) RSI sobrecomprado. Ventana amplia: rechazar solo si NO esta
+    #    sobrecomprado o si esta tan extremo que suele preceder squeeze.
+    if not (68.0 <= s_rsi <= 82.0):
         _r("reject_short_rsi")
         return None
 
@@ -551,7 +556,7 @@ def _evaluate_short_15m(
     body = abs(s_close - s_open)
     body_ratio = body / candle_range
     lower_third = s_high - (2 / 3) * candle_range
-    if not (s_close < s_open and body_ratio >= 0.65 and s_close < lower_third):
+    if not (s_close < s_open and body_ratio >= cfg.short_min_body_ratio and s_close < lower_third):
         _r("reject_short_body")
         return None
 
@@ -602,9 +607,9 @@ def _evaluate_short_15m(
     else:
         htf_penalty = 0.15  # sin contexto: penalidad leve
 
-    # 9) Score.
-    ext_score = min(1.0, (extension_atr - 1.80) / 0.80)   # 0..1 entre 1.8 y 2.6 ATR
-    rsi_score = min(1.0, (s_rsi - 70.0) / 10.0)           # 0..1 entre RSI 70 y 80
+    # 9) Score. ext_score y rsi_score escalan de forma continua.
+    ext_score = min(1.0, max(0.0, (extension_atr - 1.80) / 0.80))   # 1.8..2.6 ATR
+    rsi_score = min(1.0, max(0.0, (s_rsi - 68.0) / 12.0))           # RSI 68..80
     score = round(
         0.8 * body_ratio
         + 0.7 * ext_score
@@ -624,7 +629,8 @@ def _evaluate_short_15m(
     if risk_per_unit < (cfg.min_risk_atr * s_atr) or risk_per_unit > (cfg.max_risk_atr * s_atr):
         _r("reject_short_risk")
         return None
-    rr = 1.5
+    # RR de contra-tendencia: 1.8 para cubrir fees y dar margen positivo.
+    rr = 1.8
     tp_price = entry_price - (risk_per_unit * rr)
 
     ts = conf.get("close_time")
