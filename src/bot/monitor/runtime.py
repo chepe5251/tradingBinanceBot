@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from bot.monitor_protection import ensure_monitor_protections
+from bot.monitor.protection import ensure_monitor_protections
 
 INTERVAL_SECONDS: dict[str, int] = {
     "1m": 60,

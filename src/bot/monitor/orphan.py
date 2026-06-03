@@ -12,7 +12,7 @@ from binance.exceptions import BinanceAPIException, BinanceOrderException, Binan
 from bot.exchange_utils import safe_mark_price
 from bot.execution import STOP_ORDER_TYPES, TP_ORDER_TYPES, FuturesExecutor
 from bot.indicators import atr_last
-from bot.monitor_protection import ensure_orphan_protections, extract_orphan_protection_prices
+from bot.monitor.protection import ensure_orphan_protections, extract_orphan_protection_prices
 from bot.risk import RiskManager
 
 MONITOR_ERRORS = (

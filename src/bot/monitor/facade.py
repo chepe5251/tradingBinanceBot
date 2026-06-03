@@ -15,10 +15,10 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from binance import Client
 from bot.execution import FuturesExecutor
-from bot.monitor_decisions import evaluate_monitor_review
-from bot.monitor_orphan import resume_orphan_position
-from bot.monitor_runtime import run_position_monitor
-from bot.monitor_scaling import evaluate_loss_scaling
+from bot.monitor.decisions import evaluate_monitor_review
+from bot.monitor.orphan import resume_orphan_position
+from bot.monitor.runtime import run_position_monitor
+from bot.monitor.scaling import evaluate_loss_scaling
 from bot.risk import RiskManager
 
 if TYPE_CHECKING:
