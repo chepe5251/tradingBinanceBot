@@ -7,11 +7,11 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from config import Settings
-from risk import RiskManager
-from services.entry_service import EntryService
-from services.position_service import PositionCache
-from services.signal_service import SignalCandidate
+from bot.config import Settings
+from bot.risk import RiskManager
+from bot.services.entry_service import EntryService
+from bot.services.position_service import PositionCache
+from bot.services.signal_service import SignalCandidate
 
 
 def _close_df() -> pd.DataFrame:

@@ -7,8 +7,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from config import Settings
-from services.runtime_controller import BotApplication
+from bot.config import Settings
+from bot.services.runtime_controller import BotApplication
 
 
 @pytest.mark.unit

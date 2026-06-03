@@ -5,7 +5,7 @@ import unittest
 
 import pytest
 
-from sizing import (
+from bot.sizing import (
     SIZING_MODE_FIXED_MARGIN,
     SIZING_MODE_PCT_BALANCE,
     SIZING_MODE_RISK_BASED,

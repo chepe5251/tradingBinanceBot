@@ -12,20 +12,20 @@ from typing import Callable
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 
-from config import Settings
-from data_stream import MarketDataStream
-from execution import FuturesExecutor
-from risk import RiskManager
-from services.exchange_metadata_service import ExchangeMetadataError, ExchangeMetadataService
-from services.operational_service import OperationalService
-from services.position_service import (
+from bot.config import Settings
+from bot.data_stream import MarketDataStream
+from bot.execution import FuturesExecutor
+from bot.risk import RiskManager
+from bot.services.exchange_metadata_service import ExchangeMetadataError, ExchangeMetadataService
+from bot.services.operational_service import OperationalService
+from bot.services.position_service import (
     PositionCache,
     cleanup_open_orders,
     configure_client,
     get_available_balance,
     has_any_position_or_entry_order,
 )
-from services.signal_service import strategy_config_from_settings
+from bot.services.signal_service import strategy_config_from_settings
 
 DEFAULT_HTF_MAP: dict[str, str] = {
     "1m": "5m",

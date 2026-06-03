@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from strategy import StrategyConfig, evaluate_signal
+from bot.strategy import StrategyConfig, evaluate_signal
 
 pytestmark = pytest.mark.unit
 

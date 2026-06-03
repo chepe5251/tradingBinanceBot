@@ -5,7 +5,7 @@ from typing import Any
 
 import pandas as pd
 
-from indicators import context_direction, context_slope, ema
+from bot.indicators import context_direction, context_slope, ema
 
 
 def evaluate_early_exit(

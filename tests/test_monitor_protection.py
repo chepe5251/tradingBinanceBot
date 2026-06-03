@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from monitor_protection import ensure_monitor_protections, ensure_orphan_protections
+from bot.monitor_protection import ensure_monitor_protections, ensure_orphan_protections
 
 
 @pytest.mark.unit
@@ -24,7 +24,7 @@ def test_monitor_protection_returns_none_when_position_not_visible() -> None:
     )
     trade_state = {"tp": 110.0, "sl": 90.0, "qty": 1.0}
 
-    with patch("monitor_protection.time.time", side_effect=[0.0, 9.0]):
+    with patch("bot.monitor_protection.time.time", side_effect=[0.0, 9.0]):
         refs = ensure_monitor_protections(monitor, trade_state)
 
     assert refs is None
@@ -49,7 +49,7 @@ def test_orphan_protection_submits_emergency_close_after_repeated_failures() -> 
     trades_logger = MagicMock()
     ops_call = MagicMock()
 
-    with patch("monitor_protection.time.sleep", return_value=None):
+    with patch("bot.monitor_protection.time.sleep", return_value=None):
         refs = ensure_orphan_protections(
             executor=executor,
             side="BUY",

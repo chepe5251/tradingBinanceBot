@@ -11,9 +11,9 @@ from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from requests.exceptions import RequestException
 
-from execution import FuturesExecutor
-from monitor import PositionMonitor
-from risk import RiskManager
+from bot.execution import FuturesExecutor
+from bot.monitor import PositionMonitor
+from bot.risk import RiskManager
 
 if TYPE_CHECKING:
     from config import Settings

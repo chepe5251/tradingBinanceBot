@@ -10,11 +10,11 @@ from typing import Any, Callable, Optional
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceOrderException, BinanceRequestException
 
-from exchange_utils import safe_mark_price
-from execution import STOP_ORDER_TYPES, TP_ORDER_TYPES, FuturesExecutor
-from indicators import atr_last
-from monitor_protection import ensure_orphan_protections, extract_orphan_protection_prices
-from risk import RiskManager
+from bot.exchange_utils import safe_mark_price
+from bot.execution import STOP_ORDER_TYPES, TP_ORDER_TYPES, FuturesExecutor
+from bot.indicators import atr_last
+from bot.monitor_protection import ensure_orphan_protections, extract_orphan_protection_prices
+from bot.risk import RiskManager
 
 MONITOR_ERRORS = (
     BinanceAPIException,

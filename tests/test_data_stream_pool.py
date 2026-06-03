@@ -5,7 +5,7 @@ import unittest
 
 import pytest
 
-from data_stream import MarketDataStream
+from bot.data_stream import MarketDataStream
 
 
 class _DummySession:

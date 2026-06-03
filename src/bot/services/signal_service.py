@@ -6,9 +6,9 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from config import Settings
-from indicators import atr_series, ema, rsi
-from strategy import StrategyConfig, evaluate_signal
+from bot.config import Settings
+from bot.indicators import atr_series, ema, rsi
+from bot.strategy import StrategyConfig, evaluate_signal
 
 _INDICATOR_CACHE_LOCK = threading.Lock()
 _INDICATOR_CACHE_MAX = 8000

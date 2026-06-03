@@ -4,8 +4,8 @@ import unittest
 
 import pytest
 
-from execution import FuturesExecutor
-from services.exchange_metadata_service import (
+from bot.execution import FuturesExecutor
+from bot.services.exchange_metadata_service import (
     ExchangeMetadataService,
     SymbolMetadataNotFoundError,
 )

@@ -52,12 +52,10 @@ from datetime import datetime
 import pandas as pd
 from binance import Client
 
-# -- strategy import (one level up) --
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import from_env  # noqa: E402
-from indicators import atr_series, ema, rsi  # noqa: E402
-from services.bootstrap_service import DEFAULT_HTF_MAP, build_interval_plan  # noqa: E402
-from strategy import StrategyConfig, evaluate_signal  # noqa: E402
+from bot.config import from_env
+from bot.indicators import atr_series, ema, rsi
+from bot.services.bootstrap_service import DEFAULT_HTF_MAP, build_interval_plan
+from bot.strategy import StrategyConfig, evaluate_signal
 
 # -- configuration --
 APP_SETTINGS = from_env()

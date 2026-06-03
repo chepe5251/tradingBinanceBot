@@ -8,11 +8,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from config import Settings
-from execution import FuturesExecutor
-from risk import RiskManager
-from services.entry_service import EntryService
-from services.position_service import PositionCache
+from bot.config import Settings
+from bot.execution import FuturesExecutor
+from bot.risk import RiskManager
+from bot.services.entry_service import EntryService
+from bot.services.position_service import PositionCache
 from tests.test_strategy import _build_candidate_dataframe
 
 
@@ -143,7 +143,7 @@ class TestIntegrationPaper(unittest.TestCase):
 
             return _FakeThread()
 
-        with patch("services.entry_service.threading.Thread", side_effect=_sync_thread):
+        with patch("bot.services.entry_service.threading.Thread", side_effect=_sync_thread):
             service._on_close(interval)
 
         assert any(message.startswith("signal ") for message in handler.messages)

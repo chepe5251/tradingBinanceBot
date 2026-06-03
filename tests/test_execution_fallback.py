@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from execution import FuturesExecutor
+from bot.execution import FuturesExecutor
 
 
 def _client_with_filters() -> MagicMock:
@@ -59,8 +59,8 @@ class ExecutionFallbackTests(unittest.TestCase):
 
         executor = FuturesExecutor(client, "BTCUSDT", leverage=20, margin_type="ISOLATED", paper=False)
         with (
-            patch("execution.time.time", side_effect=[0.0, 0.0, 1.0]),
-            patch("execution.time.sleep", return_value=None),
+            patch("bot.execution.time.time", side_effect=[0.0, 0.0, 1.0]),
+            patch("bot.execution.time.sleep", return_value=None),
         ):
             qty, avg_price, exec_type = executor.place_limit_with_market_fallback(
                 side="BUY",

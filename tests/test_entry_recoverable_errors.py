@@ -7,12 +7,12 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from config import Settings
-from risk import RiskManager
-from services.domain_models import EntryFillResult
-from services.entry_service import EntryService
-from services.position_service import PositionCache
-from services.signal_service import SignalCandidate
+from bot.config import Settings
+from bot.risk import RiskManager
+from bot.services.domain_models import EntryFillResult
+from bot.services.entry_service import EntryService
+from bot.services.position_service import PositionCache
+from bot.services.signal_service import SignalCandidate
 
 
 def _df(rows: int = 20) -> pd.DataFrame:

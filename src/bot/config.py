@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from sizing import SIZING_MODE_PCT_BALANCE, normalize_sizing_mode
+from bot.sizing import SIZING_MODE_PCT_BALANCE, normalize_sizing_mode
 
 
 @dataclass

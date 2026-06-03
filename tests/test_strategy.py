@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from strategy import StrategyConfig, evaluate_signal
+from bot.strategy import StrategyConfig, evaluate_signal
 
 
 def _build_candidate_dataframe() -> pd.DataFrame:

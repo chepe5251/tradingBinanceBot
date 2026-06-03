@@ -5,7 +5,7 @@ import unittest
 import pandas as pd
 import pytest
 
-from monitor_logic import evaluate_early_exit
+from bot.monitor_logic import evaluate_early_exit
 
 
 def _build_monitor_df() -> pd.DataFrame:

@@ -8,11 +8,11 @@ import time
 
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 
-from config import Settings, from_env
-from services.bootstrap_service import RuntimeContext, bootstrap_runtime
-from services.entry_service import EntryService
-from services.position_service import count_active_positions, resume_orphaned_positions
-from services.telegram_service import TelegramService
+from bot.config import Settings, from_env
+from bot.services.bootstrap_service import RuntimeContext, bootstrap_runtime
+from bot.services.entry_service import EntryService
+from bot.services.position_service import count_active_positions, resume_orphaned_positions
+from bot.services.telegram_service import TelegramService
 
 EXCHANGE_RECOVERABLE_ERRORS = (
     BinanceAPIException,

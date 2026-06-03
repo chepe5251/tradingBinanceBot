@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from risk import RiskManager
+from bot.risk import RiskManager
 
 
 @pytest.mark.unit

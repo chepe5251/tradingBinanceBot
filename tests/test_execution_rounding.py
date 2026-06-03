@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from execution import FuturesExecutor, OrderRef
-from sizing import is_entry_size_valid
+from bot.execution import FuturesExecutor, OrderRef
+from bot.sizing import is_entry_size_valid
 
 # ── Shared fake exchange-info client ────────────────────────────────────────
 

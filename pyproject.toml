@@ -1,6 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-binance-bot"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["bot*"]
+
 [tool.pytest.ini_options]
-# Add repo root to sys.path so tests import project modules without installation.
-pythonpath = ["."]
+# src layout: add src/ to sys.path so `import bot` resolves without installation.
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 markers = [
     "unit: pure-logic tests with no network or filesystem I/O",
@@ -15,7 +28,7 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["."]
+source = ["src"]
 omit = [
     "tests/*",
     ".venv/*",

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from risk import RiskManager
+from bot.risk import RiskManager
 
 
 @pytest.mark.unit

@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from indicators import atr_last, context_direction, context_slope, ema, rsi
+from bot.indicators import atr_last, context_direction, context_slope, ema, rsi
 
 
 def _make_df(n: int = 30, start: float = 100.0, step: float = 1.0) -> pd.DataFrame:

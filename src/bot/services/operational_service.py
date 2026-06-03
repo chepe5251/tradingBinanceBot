@@ -13,7 +13,7 @@ from collections import Counter, deque
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from persistence import atomic_write_json, atomic_write_text, load_json_safe
+from bot.persistence import atomic_write_json, atomic_write_text, load_json_safe
 
 if TYPE_CHECKING:
     import logging

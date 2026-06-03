@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from monitor_logic import evaluate_early_exit
+from bot.monitor_logic import evaluate_early_exit
 
 
 def evaluate_monitor_review(monitor: Any, break_even: bool) -> tuple[bool, str]:

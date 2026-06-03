@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from config import Settings
-from risk import RiskState
-from services.operational_service import OperationalService, render_operational_markdown
+from bot.config import Settings
+from bot.risk import RiskState
+from bot.services.operational_service import OperationalService, render_operational_markdown
 
 
 def _logger() -> logging.Logger:

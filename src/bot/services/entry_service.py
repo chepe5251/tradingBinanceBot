@@ -10,13 +10,13 @@ from typing import TYPE_CHECKING
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 
-from config import Settings
-from exchange_utils import safe_mark_price
-from execution import FuturesExecutor
-from indicators import atr_last
-from monitor import PositionMonitor
-from risk import RiskManager
-from services.domain_models import (
+from bot.config import Settings
+from bot.exchange_utils import safe_mark_price
+from bot.execution import FuturesExecutor
+from bot.indicators import atr_last
+from bot.monitor import PositionMonitor
+from bot.risk import RiskManager
+from bot.services.domain_models import (
     EntryAttempt,
     EntryFillResult,
     EntryValidationResult,
@@ -25,10 +25,10 @@ from services.domain_models import (
     TradePlan,
     TradeState,
 )
-from services.position_service import PositionCache, count_active_positions, get_available_balance
-from services.signal_service import SignalCandidate, evaluate_interval_signals
-from services.telegram_service import TelegramService, format_signal_message
-from sizing import (
+from bot.services.position_service import PositionCache, count_active_positions, get_available_balance
+from bot.services.signal_service import SignalCandidate, evaluate_interval_signals
+from bot.services.telegram_service import TelegramService, format_signal_message
+from bot.sizing import (
     SIZING_MODE_FIXED_MARGIN,
     PositionSizer,
     SizingInputs,

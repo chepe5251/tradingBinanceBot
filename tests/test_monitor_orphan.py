@@ -7,9 +7,9 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from config import Settings
-from monitor_orphan import resume_orphan_position
-from risk import RiskManager
+from bot.config import Settings
+from bot.monitor_orphan import resume_orphan_position
+from bot.risk import RiskManager
 
 
 @pytest.mark.unit
@@ -32,7 +32,7 @@ class MonitorOrphanTests(unittest.TestCase):
         stream = MagicMock()
         stream.get_dataframe.return_value = pd.DataFrame()
 
-        with patch("monitor_orphan.threading.Thread") as thread_mock:
+        with patch("bot.monitor_orphan.threading.Thread") as thread_mock:
             resume_orphan_position(
                 orphan={"symbol": "BTCUSDT", "positionAmt": "NaN", "entryPrice": "x"},
                 symbols=["BTCUSDT"],
@@ -54,7 +54,7 @@ class MonitorOrphanTests(unittest.TestCase):
         stream = MagicMock()
         stream.get_dataframe.return_value = pd.DataFrame()
 
-        with patch("monitor_orphan.threading.Thread") as thread_mock:
+        with patch("bot.monitor_orphan.threading.Thread") as thread_mock:
             resume_orphan_position(
                 orphan={"symbol": "ETHUSDT", "positionAmt": "1", "entryPrice": "100"},
                 symbols=["BTCUSDT"],

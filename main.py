@@ -1,7 +1,7 @@
 """Application entrypoint for the Binance Futures trading bot."""
 from __future__ import annotations
 
-from services.runtime_controller import BotApplication
+from bot.services.runtime_controller import BotApplication
 
 
 def main() -> None:
