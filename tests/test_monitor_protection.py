@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from bot.monitor_protection import ensure_monitor_protections, ensure_orphan_protections
 
 

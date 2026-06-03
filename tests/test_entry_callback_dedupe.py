@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
-
 from bot.config import Settings
 from bot.risk import RiskManager
 from bot.services.entry_service import EntryService

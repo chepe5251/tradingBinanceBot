@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 
 import pytest
-
 from bot.execution import FuturesExecutor
 from bot.services.exchange_metadata_service import (
     ExchangeMetadataService,

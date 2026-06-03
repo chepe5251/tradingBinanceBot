@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import pandas as pd
-
 from bot.indicators import atr_series, ema, rsi
 
 

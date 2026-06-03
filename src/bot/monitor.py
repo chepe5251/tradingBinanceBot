@@ -14,7 +14,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Callable, Optional
 
 from binance import Client
-
 from bot.execution import FuturesExecutor
 from bot.monitor_decisions import evaluate_monitor_review
 from bot.monitor_orphan import resume_orphan_position

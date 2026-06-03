@@ -6,7 +6,6 @@ import unittest
 import numpy as np
 import pandas as pd
 import pytest
-
 from bot.indicators import atr_last, context_direction, context_slope, ema, rsi
 
 

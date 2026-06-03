@@ -7,7 +7,6 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from bot.risk import RiskManager
 
 

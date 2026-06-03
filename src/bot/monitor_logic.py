@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import Any
 
 import pandas as pd
-
 from bot.indicators import context_direction, context_slope, ema
 
 

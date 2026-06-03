@@ -7,12 +7,12 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from bot.config import Settings
 from bot.execution import FuturesExecutor
 from bot.risk import RiskManager
 from bot.services.entry_service import EntryService
 from bot.services.position_service import PositionCache
+
 from tests.test_strategy import _build_candidate_dataframe
 
 

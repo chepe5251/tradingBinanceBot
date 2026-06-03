@@ -11,7 +11,6 @@ from typing import Callable
 
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
-
 from bot.config import Settings
 from bot.data_stream import MarketDataStream
 from bot.execution import FuturesExecutor

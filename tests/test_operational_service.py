@@ -4,7 +4,6 @@ import logging
 from pathlib import Path
 
 import pytest
-
 from bot.config import Settings
 from bot.risk import RiskState
 from bot.services.operational_service import OperationalService, render_operational_markdown

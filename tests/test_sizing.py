@@ -4,7 +4,6 @@ from __future__ import annotations
 import unittest
 
 import pytest
-
 from bot.sizing import (
     SIZING_MODE_FIXED_MARGIN,
     SIZING_MODE_PCT_BALANCE,

@@ -9,11 +9,10 @@ from typing import TYPE_CHECKING, Callable
 
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
-from requests.exceptions import RequestException
-
 from bot.execution import FuturesExecutor
 from bot.monitor import PositionMonitor
 from bot.risk import RiskManager
+from requests.exceptions import RequestException
 
 if TYPE_CHECKING:
     from config import Settings

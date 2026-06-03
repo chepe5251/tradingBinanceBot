@@ -4,7 +4,6 @@ import unittest
 
 import pandas as pd
 import pytest
-
 from bot.monitor_logic import evaluate_early_exit
 
 

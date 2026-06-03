@@ -3,7 +3,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from bot.services.position_service import configure_client
 
 

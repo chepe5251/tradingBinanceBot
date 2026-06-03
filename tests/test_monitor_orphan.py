@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
-
 from bot.config import Settings
 from bot.monitor_orphan import resume_orphan_position
 from bot.risk import RiskManager

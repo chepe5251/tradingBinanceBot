@@ -43,7 +43,6 @@ import multiprocessing
 import os
 import re
 import statistics
-import sys
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -51,7 +50,6 @@ from datetime import datetime
 
 import pandas as pd
 from binance import Client
-
 from bot.config import from_env
 from bot.indicators import atr_series, ema, rsi
 from bot.services.bootstrap_service import DEFAULT_HTF_MAP, build_interval_plan

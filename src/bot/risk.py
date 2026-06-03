@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
-
 from bot.persistence import atomic_write_json, load_json_safe
 
 logger = logging.getLogger(__name__)

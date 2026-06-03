@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-
 from bot.config import Settings
 from bot.services.runtime_controller import BotApplication
 

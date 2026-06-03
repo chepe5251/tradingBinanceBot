@@ -7,7 +7,6 @@ import threading
 import time
 
 from binance.exceptions import BinanceAPIException, BinanceRequestException
-
 from bot.config import Settings, from_env
 from bot.services.bootstrap_service import RuntimeContext, bootstrap_runtime
 from bot.services.entry_service import EntryService

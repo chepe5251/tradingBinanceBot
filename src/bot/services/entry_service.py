@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
-
 from bot.config import Settings
 from bot.exchange_utils import safe_mark_price
 from bot.execution import FuturesExecutor
@@ -25,7 +24,11 @@ from bot.services.domain_models import (
     TradePlan,
     TradeState,
 )
-from bot.services.position_service import PositionCache, count_active_positions, get_available_balance
+from bot.services.position_service import (
+    PositionCache,
+    count_active_positions,
+    get_available_balance,
+)
 from bot.services.signal_service import SignalCandidate, evaluate_interval_signals
 from bot.services.telegram_service import TelegramService, format_signal_message
 from bot.sizing import (

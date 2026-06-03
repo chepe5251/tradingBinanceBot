@@ -9,7 +9,6 @@ from typing import Any, Callable, Optional
 
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceOrderException, BinanceRequestException
-
 from bot.exchange_utils import safe_mark_price
 from bot.execution import STOP_ORDER_TYPES, TP_ORDER_TYPES, FuturesExecutor
 from bot.indicators import atr_last

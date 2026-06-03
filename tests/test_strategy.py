@@ -5,7 +5,6 @@ import unittest
 import numpy as np
 import pandas as pd
 import pytest
-
 from bot.strategy import StrategyConfig, evaluate_signal
 
 

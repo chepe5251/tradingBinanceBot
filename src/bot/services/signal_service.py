@@ -5,7 +5,6 @@ import threading
 from dataclasses import dataclass
 
 import pandas as pd
-
 from bot.config import Settings
 from bot.indicators import atr_series, ema, rsi
 from bot.strategy import StrategyConfig, evaluate_signal

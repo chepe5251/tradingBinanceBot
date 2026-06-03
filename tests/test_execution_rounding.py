@@ -4,7 +4,6 @@ import unittest
 from unittest.mock import MagicMock
 
 import pytest
-
 from bot.execution import FuturesExecutor, OrderRef
 from bot.sizing import is_entry_size_valid
 

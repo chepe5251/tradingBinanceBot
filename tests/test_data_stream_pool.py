@@ -4,7 +4,6 @@ import threading
 import unittest
 
 import pytest
-
 from bot.data_stream import MarketDataStream
 
 
