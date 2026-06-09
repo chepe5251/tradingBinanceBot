@@ -7,10 +7,13 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
-import pandas as pd
 from bot.risk.repository import JsonRiskRepository
 from bot.risk.state import RiskState
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 @dataclass
