@@ -4,10 +4,9 @@ from __future__ import annotations
 from typing import Optional
 
 import pandas as pd
-
 from bot.indicators import ema
-from bot.strategy.config import StrategyConfig
 from bot.strategy._helpers import _bump_reject
+from bot.strategy.config import StrategyConfig
 
 
 def _evaluate_short_15m(

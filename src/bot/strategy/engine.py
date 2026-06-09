@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import Optional
 
 import pandas as pd
-
 from bot.indicators import atr_series, ema, rsi
 from bot.strategy.bos_retest import _evaluate_bos_4h
 from bot.strategy.config import StrategyConfig

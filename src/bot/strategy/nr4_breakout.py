@@ -4,10 +4,9 @@ from __future__ import annotations
 from typing import Optional
 
 import pandas as pd
-
 from bot.indicators import ema
-from bot.strategy.config import StrategyConfig
 from bot.strategy._helpers import _bump_reject, _format_breakout_time
+from bot.strategy.config import StrategyConfig
 
 
 def _evaluate_nr4_1d(
