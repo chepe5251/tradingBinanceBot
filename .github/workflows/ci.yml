@@ -18,10 +18,10 @@ jobs:
           python-version: "3.11"
 
       - name: Install ruff
-        run: pip install ruff==0.4.4
+        run: python -m pip install ruff==0.4.4
 
       - name: Run ruff
-        run: ruff check .
+        run: python -m ruff check .
 
   test:
     name: Tests (pytest)
@@ -34,7 +34,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
       - name: Syntax check (py_compile)
         run: |
