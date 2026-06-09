@@ -67,8 +67,8 @@ jobs:
       - name: Coverage report (core modules)
         run: |
           python -m pytest tests/ \
-            --cov=risk --cov=strategy --cov=sizing \
-            --cov=execution --cov=monitor_logic --cov=indicators \
+            --cov=bot.risk --cov=bot.strategy --cov=bot.sizing \
+            --cov=bot.execution --cov=bot.monitor.logic --cov=bot.indicators \
             --cov-report=term-missing \
             -q
 

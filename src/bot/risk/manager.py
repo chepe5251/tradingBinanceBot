@@ -1,32 +1,16 @@
-"""Risk state tracking and trade throttling primitives.
+"""Risk manager: pure trading risk logic.
 
-The logic in this module is intentionally side-effect free except for updates
-to in-memory state, which makes it safe to call on every candle close.
+No I/O. Persistence is delegated to an injected JsonRiskRepository.
 """
 from __future__ import annotations
 
-import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
-from bot.persistence import atomic_write_json, load_json_safe
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class RiskState:
-    """Mutable runtime state used by `RiskManager` decision rules."""
-
-    consecutive_losses: int = 0
-    last_trade_time: datetime | None = None
-    day_start_equity: float = 0.0
-    current_day: datetime | None = None
-    equity: float = 0.0
-    paused: bool = False
-    loss_pause_until: datetime | None = None
+from bot.risk.repository import JsonRiskRepository
+from bot.risk.state import RiskState
 
 
 @dataclass
@@ -44,8 +28,13 @@ class RiskManager:
     loss_pause_sec: int
     volatility_pause: bool
     volatility_threshold: float
-    state: RiskState = field(default_factory=RiskState)
+    repository: JsonRiskRepository | None = None
+    state: RiskState = field(default_factory=RiskState, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.repository is not None:
+            self.state = self.repository.load()
 
     def init_equity(self, equity: float) -> None:
         """Initialize day/equity baselines at process startup."""
@@ -152,46 +141,6 @@ class RiskManager:
                 paused=self.state.paused,
                 loss_pause_until=self.state.loss_pause_until,
             )
-
-    def save(self, path: str) -> None:
-        """Persist RiskState to disk as JSON for restart recovery."""
-        with self._lock:
-            data = {
-                "consecutive_losses": self.state.consecutive_losses,
-                "last_trade_time": self.state.last_trade_time.isoformat() if self.state.last_trade_time else None,
-                "day_start_equity": self.state.day_start_equity,
-                "current_day": self.state.current_day.isoformat() if self.state.current_day else None,
-                "equity": self.state.equity,
-                "paused": self.state.paused,
-                "loss_pause_until": self.state.loss_pause_until.isoformat() if self.state.loss_pause_until else None,
-            }
-        atomic_write_json(path, data)
-
-    def load(self, path: str) -> None:
-        """Restore RiskState from JSON if it exists, tolerating corruption."""
-        data = load_json_safe(
-            path,
-            on_corrupt=lambda err: logger.warning(
-                "risk_state_corrupt path=%s err=%s (moved to .bad)", path, err
-            ),
-        )
-        if not data:
-            return
-
-        try:
-            with self._lock:
-                self.state.consecutive_losses = int(data.get("consecutive_losses", 0))
-                lt = data.get("last_trade_time")
-                self.state.last_trade_time = datetime.fromisoformat(lt) if lt else None
-                cd = data.get("current_day")
-                self.state.current_day = date.fromisoformat(cd) if cd else None
-                self.state.day_start_equity = float(data.get("day_start_equity", 0.0))
-                self.state.equity = float(data.get("equity", 0.0))
-                self.state.paused = bool(data.get("paused", False))
-                lpu = data.get("loss_pause_until")
-                self.state.loss_pause_until = datetime.fromisoformat(lpu) if lpu else None
-        except (TypeError, ValueError) as exc:
-            logger.warning("risk_state_invalid_payload path=%s err=%s", path, exc)
 
     def volatility_ok(self, df: pd.DataFrame) -> bool:
         """Check optional single-candle volatility guard."""

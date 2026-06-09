@@ -18,6 +18,8 @@ COPY --from=builder /install /usr/local
 # Copy source (only what .dockerignore allows)
 COPY . .
 
+ENV PYTHONPATH=/app/src
+
 # Logs directory owned by botuser
 RUN mkdir -p logs && chown -R botuser:botuser /app
 

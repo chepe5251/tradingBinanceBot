@@ -22,7 +22,7 @@ class RuntimeControllerTests(unittest.TestCase):
             stream=MagicMock(),
             logger=logging.getLogger("test.runtime.shutdown"),
         )
-        runtime.risk.save.side_effect = OSError("disk issue")
+        runtime.risk.repository.save.side_effect = OSError("disk issue")
         runtime.operations.save_state.side_effect = OSError("disk issue")
         app.runtime = runtime
 

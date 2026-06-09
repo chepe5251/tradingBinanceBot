@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from bot.risk import RiskManager
+from bot.risk import JsonRiskRepository, RiskManager
 
 
 @pytest.mark.unit
@@ -102,10 +102,20 @@ class RiskManagerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.json")
-            risk.save(path)
+            repo = JsonRiskRepository(path)
+            repo.save(risk.state)
 
-            risk2 = self._build_risk()
-            risk2.load(path)
+            repo2 = JsonRiskRepository(path)
+            risk2 = RiskManager(
+                cooldown_sec=180,
+                max_consecutive_losses=2,
+                daily_drawdown_limit=0.20,
+                daily_drawdown_limit_usdt=5.0,
+                loss_pause_sec=3600,
+                volatility_pause=False,
+                volatility_threshold=0.0,
+                repository=repo2,
+            )
 
             s = risk2.snapshot()
             self.assertAlmostEqual(s.equity, 97.0)
@@ -113,21 +123,20 @@ class RiskManagerTests(unittest.TestCase):
             self.assertEqual(s.last_trade_time, t0)
 
     def test_load_missing_file_is_no_op(self) -> None:
-        """load() must not raise when the file does not exist."""
-        risk = self._build_risk()
-        risk.load("/nonexistent/path/state.json")  # must not raise
-        self.assertAlmostEqual(risk.snapshot().equity, 100.0)
+        """Repository load() must return fresh RiskState when file does not exist."""
+        repo = JsonRiskRepository("/nonexistent/path/state.json")
+        state = repo.load()  # must not raise
+        self.assertAlmostEqual(state.equity, 0.0)
 
     def test_load_corrupt_file_falls_back_to_fresh_state(self) -> None:
-        """load() with corrupt JSON must silently fall back to the current state."""
-        risk = self._build_risk()
+        """Repository load() with corrupt JSON must silently return fresh state."""
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "bad.json")
             with open(path, "w") as fh:
                 fh.write("{not valid json")
-            risk.load(path)
-        # State unchanged from init_equity
-        self.assertAlmostEqual(risk.snapshot().equity, 100.0)
+            repo = JsonRiskRepository(path)
+            state = repo.load()
+        self.assertAlmostEqual(state.equity, 0.0)
 
 
 if __name__ == "__main__":

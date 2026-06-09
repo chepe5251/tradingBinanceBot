@@ -196,7 +196,7 @@ class BotApplication:
         if not self.runtime:
             return
         try:
-            self.runtime.risk.save("logs/risk_state.json")
+            self.runtime.risk.repository.save(self.runtime.risk.state)
         except OSError as exc:
             self.runtime.logger.warning("risk_state_save_failed err=%s", exc)
         try:

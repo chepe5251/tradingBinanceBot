@@ -14,7 +14,7 @@ from binance.exceptions import BinanceAPIException, BinanceRequestException
 from bot.config import Settings
 from bot.data_stream import MarketDataStream
 from bot.execution import FuturesExecutor
-from bot.risk import RiskManager
+from bot.risk import JsonRiskRepository, RiskManager
 from bot.services.exchange_metadata_service import ExchangeMetadataError, ExchangeMetadataService
 from bot.services.operational_service import OperationalService
 from bot.services.position_service import (
@@ -252,7 +252,8 @@ def _build_stream(
     )
 
 
-def _build_risk_manager(settings: Settings) -> RiskManager:
+def _build_risk_manager(settings: Settings, state_path: str = "logs/risk_state.json") -> RiskManager:
+    repository = JsonRiskRepository(state_path)
     return RiskManager(
         cooldown_sec=settings.cooldown_sec,
         max_consecutive_losses=settings.max_consecutive_losses,
@@ -261,6 +262,7 @@ def _build_risk_manager(settings: Settings) -> RiskManager:
         loss_pause_sec=settings.risk_pause_after_losses_sec,
         volatility_pause=False,
         volatility_threshold=0.0,
+        repository=repository,
     )
 
 
@@ -308,7 +310,6 @@ def bootstrap_runtime(settings: Settings, api_key: str, api_secret: str) -> Runt
             return executors[symbol]
 
     risk = _build_risk_manager(settings)
-    risk.load("logs/risk_state.json")
 
     mode = "PAPER" if settings.use_paper_trading else ("TESTNET" if settings.use_testnet else "LIVE")
     operations.set_runtime_mode(mode)
